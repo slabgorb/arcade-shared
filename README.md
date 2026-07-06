@@ -41,8 +41,15 @@ render pipelines, sim bodies, and input maps stay in their own repos.
 
 ## Status
 
-Scaffold pending — package layout, `exports` map, and the `prepare` build land in story
-**SH-1**. Extraction sequence (per the `SH` epic): math3d → rng → highscore/storage → loop.
+Scaffolded (**SH-1**) — the package layout, the `exports` subpath map, and the `prepare`
+build (tsc → ESM + `.d.ts`) are in place, and the version-pinned git-URL dependency pipe is
+proven end-to-end (battlezone consumes `@arcade/shared` at a pinned tag with its `vite build`
++ `vitest` green). The package currently exposes only a trivial `SHARED_VERSION` marker.
+Extraction sequence (per the `SH` epic): math3d → rng → highscore/storage → loop.
+
+```ts
+import { SHARED_VERSION } from '@arcade/shared'
+```
 
 ## Provenance
 
