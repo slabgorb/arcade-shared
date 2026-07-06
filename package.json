@@ -1,6 +1,6 @@
 {
   "name": "@arcade/shared",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shared library for the slabgorb browser vector-arcade games (ADR-0001). Consumed as a version-pinned git-URL dependency.",
   "type": "module",
   "license": "MIT",
@@ -16,15 +16,20 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./math3d": {
+      "types": "./dist/math3d.d.ts",
+      "import": "./dist/math3d.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "prepare": "tsc -p tsconfig.build.json",
-    "test": "echo \"(no tests yet — the first suite lands with the math3d extraction in SH-2)\" && exit 0"
+    "test": "vitest run"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.9"
   }
 }
