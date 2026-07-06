@@ -22,9 +22,10 @@
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "prepare": "tsc -p tsconfig.build.json",
-    "test": "echo \"(no tests yet — the first suite lands with the math3d extraction in SH-2)\" && exit 0"
+    "test": "vitest run"
   },
   "devDependencies": {
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.9"
   }
 }
