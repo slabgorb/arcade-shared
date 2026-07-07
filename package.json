@@ -1,6 +1,6 @@
 {
   "name": "@arcade/shared",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared library for the slabgorb browser vector-arcade games (ADR-0001). Consumed as a version-pinned git-URL dependency.",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,10 @@
     "./rng": {
       "types": "./dist/rng.d.ts",
       "import": "./dist/rng.js"
+    },
+    "./highscore": {
+      "types": "./dist/highscore.d.ts",
+      "import": "./dist/highscore.js"
     },
     "./package.json": "./package.json"
   },
