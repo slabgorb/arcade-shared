@@ -8,9 +8,10 @@
 //
 // The first genuine payloads arrive next and are added here as subpath exports,
 // per the SH epic sequence:
-//   - SH-2  ./math3d  — the ported Atari "Math Box"
-//   - SH-3  ./rng     — the seeded mulberry32 PRNG
-//   - later ./highscore, ./loop
+//   - SH-2  ./math3d    — the ported Atari "Math Box"
+//   - SH-3  ./rng       — the seeded mulberry32 PRNG
+//   - SH-4  ./highscore — the high-score table logic + localStorage seam
+//   - later ./loop
 //
 // Eligibility bar (ADR-0001): only code byte/algorithm-identical across >=2
 // games belongs here. Game-specific render pipelines, sim bodies, and input
@@ -24,4 +25,4 @@
  * silently alter a frozen game's determinism/replay behaviour. This trivial,
  * side-effect-free export is what SH-1's consumer proof imports.
  */
-export const SHARED_VERSION = '0.3.0'
+export const SHARED_VERSION = '0.4.0'
