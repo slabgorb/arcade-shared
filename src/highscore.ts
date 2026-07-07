@@ -6,8 +6,8 @@
 // entries by convention only. This module lifts all of it into one place and
 // turns that convention into a compile-time contract:
 //
-//   - The entry type is GENERIC over the domain field: tempest/star-wars record
-//     `level`, asteroids records `wave`, so HighScoreEntry<'level'> and
+//   - The entry type is GENERIC over the domain field: tempest records `level`;
+//     star-wars and asteroids record `wave`, so HighScoreEntry<'level'> and
 //     HighScoreEntry<'wave'> share every other field. The stored JSON keeps each
 //     game's real field name — no localStorage migration.
 //   - The row guard requires a FINITE score (and finite domain field). The three
