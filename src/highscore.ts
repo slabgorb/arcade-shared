@@ -36,7 +36,7 @@ export interface HighScoreEntryBase {
 }
 
 /** A high-score entry with its game's numeric domain field mixed in by name:
- *  HighScoreEntry<'level'> for tempest/star-wars, HighScoreEntry<'wave'> for
+ *  HighScoreEntry<'level'> for tempest, HighScoreEntry<'wave'> for star-wars and
  *  asteroids. */
 export type HighScoreEntry<DomainKey extends string> = HighScoreEntryBase & {
   [K in DomainKey]: number
