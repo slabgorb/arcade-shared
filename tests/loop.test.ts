@@ -25,7 +25,7 @@
 // RED until GREEN adds arcade-shared/src/loop.ts + the "./loop" subpath export.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { createLoop } from '../src/loop'
+import { createLoop, advanceFixedSteps } from '../src/loop'
 
 const HZ = 60
 const DT = 1 / HZ // 0.016666… — the constant timestep fed to step()
@@ -221,5 +221,87 @@ describe('createLoop — the started-boolean fix (AC-1, carried from asteroids)'
     tick(0) // baseline at 0
     tick(20) // +20ms → one DT sub-step; the buggy sentinel would drop it
     expect(steps).toBe(1)
+  })
+})
+
+describe('advanceFixedSteps — pure fixed-step accumulator (SH-5, AC-3 composition seam)', () => {
+  // The pure kernel createLoop delegates to and tempest's richer wrapper composes
+  // OVER (AC-3): fold `elapsed` seconds into `acc`, run one step(dt) per whole
+  // timestep, and return the leftover carry in [0, dt). It owns NO clock and NO
+  // requestAnimationFrame — the caller holds `acc` and supplies the elapsed span —
+  // which is exactly what lets tempest keep its injected now() clock while still
+  // sharing this arithmetic instead of duplicating it.
+
+  it('runs no sub-step and just carries when acc + elapsed < dt', () => {
+    let steps = 0
+    const acc = advanceFixedSteps(0, 0.005, DT, () => {
+      steps++
+    }) // 5ms < 16.67ms
+    expect(steps).toBe(0)
+    expect(acc).toBeCloseTo(0.005, 10) // the sub-dt span is retained, not dropped
+  })
+
+  it('runs floor((acc + elapsed) / dt) sub-steps and returns the remainder in [0, dt)', () => {
+    let steps = 0
+    const acc = advanceFixedSteps(0, 0.09, DT, () => {
+      steps++
+    }) // 90ms → 5 whole steps, 0.4-of-a-step carry
+    expect(steps).toBe(5)
+    expect(acc).toBeCloseTo(0.09 - 5 * DT, 10)
+    expect(acc).toBeGreaterThanOrEqual(0)
+    expect(acc).toBeLessThan(DT)
+  })
+
+  it('feeds step a constant dt on every sub-step', () => {
+    const dts: number[] = []
+    advanceFixedSteps(0, 0.05, DT, (dt) => dts.push(dt)) // 50ms → 3 steps
+    expect(dts).toEqual([DT, DT, DT])
+  })
+
+  it('clamps elapsed to the default 0.25s so a long stall cannot flood sub-steps', () => {
+    let steps = 0
+    advanceFixedSteps(0, 5, DT, () => {
+      steps++
+    }) // 5s → clamp to 0.25s
+    expect(steps).toBe(Math.round(CLAMP / DT)) // 15, not ~300
+  })
+
+  it('honours a custom maxFrame clamp', () => {
+    let steps = 0
+    advanceFixedSteps(
+      0,
+      5,
+      DT,
+      () => {
+        steps++
+      },
+      0.1,
+    ) // clamp to 0.1s → 6 sub-steps
+    expect(steps).toBe(6)
+  })
+
+  it('threads a nonzero starting acc: carry accumulates across calls', () => {
+    let steps = 0
+    // 10ms carried in + 10ms elapsed = 20ms → one sub-step, (20ms − DT) carry out.
+    const acc = advanceFixedSteps(0.01, 0.01, DT, () => {
+      steps++
+    })
+    expect(steps).toBe(1)
+    expect(acc).toBeCloseTo(0.02 - DT, 10)
+  })
+
+  it('is pure and clock/rAF-free: identical inputs give identical output, and it schedules no frame', () => {
+    let a = 0
+    const accA = advanceFixedSteps(0.003, 0.05, DT, () => {
+      a++
+    })
+    let b = 0
+    const accB = advanceFixedSteps(0.003, 0.05, DT, () => {
+      b++
+    })
+    expect(a).toBe(b) // identical inputs → identical step count (no hidden clock/random)
+    expect(accA).toBe(accB) // …and identical carry
+    expect(pending).toBeNull() // never scheduled a requestAnimationFrame
+    expect(cancelled).toEqual([]) // …and never cancelled one
   })
 })
