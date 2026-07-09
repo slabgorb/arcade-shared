@@ -91,6 +91,21 @@ const ROM: Readonly<Record<string, readonly Vec[]>> = {
   '7': [[0, 24, 0], [16, 0, 1], [0, -24, 1], [8, 0, 0]],
   '8': [[16, 0, 1], [0, 24, 1], [-16, 0, 1], [0, -24, 1], [0, 12, 0], [16, 0, 1], [8, -12, 0]],
   '9': [[16, 0, 0], [0, 24, 1], [-16, 0, 1], [0, -12, 1], [16, 0, 1], [8, -12, 0]],
+
+  // --- SH2-3 additions (epic SH2): characters the cabinet renders that the
+  // original ANVGAN.MAC alphabet lacks. These are NOT verbatim ROM data — the
+  // Atari font was caps-only alphanumerics + DASH. They are NEW glyphs DRAWN to
+  // match the VGMSGA monoline style (same 16x24 cell, integer grid, 24-unit
+  // advance so HUD columns stay aligned), one per game that needs it:
+  //   ','  star-wars — en-US score/bonus grouping (toLocaleString): a short tail
+  //        hanging below the baseline, (8,4) -> (4,-4).
+  //   '/'  battlezone — pause control card 'E / D' / 'I / K': a full-cell
+  //        lower-left -> upper-right diagonal, (0,0) -> (16,24).
+  //   '_'  asteroids  — initials-entry placeholder echo: a bar along the
+  //        baseline, (0,0) -> (16,0).
+  ',': [[8, 4, 0], [-4, -8, 1], [20, 4, 0]],
+  '/': [[16, 24, 1], [8, -24, 0]],
+  '_': [[16, 0, 1], [8, 0, 0]],
 }
 
 /** Accumulate a ROM VCTR chain into ink polylines + an advance. */
@@ -124,8 +139,9 @@ const GLYPHS: Readonly<Record<string, VecGlyph>> = (() => {
   return out
 })()
 
-/** Every character the font can draw, in a stable order (space, digits, A-Z, dash). */
-export const GLYPH_CHARS = ' 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-'
+/** Every character the font can draw, in a stable order (space, digits, A-Z,
+ *  dash, then the SH2-3 punctuation: comma, slash, underscore). */
+export const GLYPH_CHARS = ' 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-,/_'
 
 const BLANK: VecGlyph = GLYPHS[' ']
 
