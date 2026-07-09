@@ -32,12 +32,17 @@
       "types": "./dist/loop.d.ts",
       "import": "./dist/loop.js"
     },
+    "./font": {
+      "types": "./dist/font.d.ts",
+      "import": "./dist/font.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "clean": "rm -rf dist",
     "prepare": "tsc -p tsconfig.build.json",
+    "pretest": "tsc -p tsconfig.build.json",
     "test": "vitest run"
   },
   "devDependencies": {
