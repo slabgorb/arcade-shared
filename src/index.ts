@@ -25,4 +25,4 @@
  * silently alter a frozen game's determinism/replay behaviour. This trivial,
  * side-effect-free export is what SH-1's consumer proof imports.
  */
-export const SHARED_VERSION = '0.5.0'
+export const SHARED_VERSION = '0.6.0'
