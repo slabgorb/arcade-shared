@@ -24,14 +24,17 @@
 //   esc-overlay.ts must import layoutText from './font' (the shared font).
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-// Record the strings handed to layoutText — the text seam. Returns a trivial
-// one-stroke glyph run so the caller's stroking loop runs end-to-end.
+// Record the text AND the layout opts handed to layoutText — the text seam. The
+// mock mirrors the real layoutText(text, opts?) signature so the suite can verify
+// the per-glyph tracking is actually forwarded to the font layer (not dropped).
+// Returns a trivial one-stroke glyph run so the caller's stroking loop runs
+// end-to-end.
 const font = vi.hoisted(() => {
-  const calls: { text: string }[] = []
+  const calls: { text: string; opts?: { letterSpacing?: number } }[] = []
   return {
     calls,
-    layoutText(text: string) {
-      calls.push({ text })
+    layoutText(text: string, opts?: { letterSpacing?: number }) {
+      calls.push({ text, opts })
       return { strokes: [{ points: [{ x: 0, y: 0 }, { x: 16, y: 0 }] }], width: 16 }
     },
   }
@@ -122,6 +125,21 @@ describe('SH2-12 — drawEscOverlay: the keybind card', () => {
     for (const line of nonBlank) {
       expect(routed(), `card line "${line}" must be routed through layoutText`).toContain(line)
     }
+  })
+
+  it('forwards the ~0.1em inter-glyph tracking to layoutText (GLYPH_TRACKING = 0.1 * CELL_H)', async () => {
+    // The thin ROM caps read cramped at 0 tracking; drawEscOverlay must forward
+    // the letterSpacing to the font layer, not drop it. CELL_H is mocked to 24, so
+    // the expected tracking is 0.1 * 24 = 2.4 glyph-cell units.
+    const { drawEscOverlay } = await import('../src/esc-overlay')
+    const { ctx } = recordingCtx()
+    drawEscOverlay(ctx, W, H, opts({ lines: ['PAUSED'] }))
+    const call = font.calls.find((c) => c.text === 'PAUSED')
+    expect(call, 'the card line must reach layoutText').toBeDefined()
+    expect(
+      call?.opts?.letterSpacing,
+      'letterSpacing (0.1em tracking) must be forwarded to layoutText, not dropped',
+    ).toBe(0.1 * 24)
   })
 
   it('does NOT route blank spacer lines through the font', async () => {

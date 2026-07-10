@@ -10,7 +10,7 @@
 // ctx, so it is EXEMPT from the pure-core purity guard (which keeps /pause and the
 // rest of the pure core DOM-free). It references no DOM global directly — it only
 // calls methods on the ctx the game hands in.
-import { layoutText, CELL_H } from './font'
+import { layoutText, CELL_H } from './font.js'
 
 /** Per-cabinet parameters. Everything that differs between games is here; the
  *  mechanism (dim + centred card) is not. */
