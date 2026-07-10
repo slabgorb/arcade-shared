@@ -48,6 +48,10 @@
       "types": "./dist/esc-overlay.d.ts",
       "import": "./dist/esc-overlay.js"
     },
+    "./glow": {
+      "types": "./dist/glow.d.ts",
+      "import": "./dist/glow.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
