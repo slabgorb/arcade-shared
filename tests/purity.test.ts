@@ -31,9 +31,11 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 // Pure subpaths per ADR-0003 Amendment 1 — must remain DOM-free.
+// SH2-13 adds 'name-entry' (the shared keyboard initials-entry reducer): a
+// pure string reducer with no DOM surface at all, so it joins the fence.
 // SH2-12: `pause` (the game-agnostic frozen-frame gate) joins the pure core — it
 // is a boolean toggle + a thunk-selector with no DOM, so the guard polices it.
-const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'pause'] as const
+const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'name-entry', 'pause'] as const
 
 // Browser subpaths (ADR-0003) — explicitly flagged as canvas/DOM-touching and so
 // EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel

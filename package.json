@@ -36,6 +36,10 @@
       "types": "./dist/font.d.ts",
       "import": "./dist/font.js"
     },
+    "./name-entry": {
+      "types": "./dist/name-entry.d.ts",
+      "import": "./dist/name-entry.js"
+    },
     "./pause": {
       "types": "./dist/pause.d.ts",
       "import": "./dist/pause.js"
