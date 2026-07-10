@@ -37,8 +37,9 @@ const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'pause'] as
 
 // Browser subpaths (ADR-0003) — explicitly flagged as canvas/DOM-touching and so
 // EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel
-// + keybind card). These must never be added to PURE_SUBPATHS.
-const BROWSER_SUBPATHS = ['esc-overlay'] as const
+// + keybind card); SH2-8 adds `glow` (the neon-vector primitive: withGlow +
+// glowPolyline). These must never be added to PURE_SUBPATHS.
+const BROWSER_SUBPATHS = ['esc-overlay', 'glow'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -139,5 +140,28 @@ describe('SH2-12 — pause (pure) + esc-overlay (browser) subpaths', () => {
   it('every browser subpath is actually built into dist/', () => {
     const missing = BROWSER_SUBPATHS.filter((s) => !existsSync(distPath(s)))
     expect(missing, `missing built browser subpaths in dist/: ${missing.join(', ')}`).toEqual([])
+  })
+})
+
+describe('SH2-8 — glow (browser subpath)', () => {
+  const pkg = () =>
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+
+  it('glow is classified BROWSER (canvas-exempt) and NEVER policed as pure', () => {
+    // glow legitimately touches a canvas ctx (strokeStyle/shadowBlur), so it must be
+    // browser-exempt — and must never be smuggled into the DOM-free pure set.
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('glow')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('glow')
+  })
+
+  it('exports["./glow"] maps to the built browser ESM + types', () => {
+    const p = pkg()
+    expect(p.exports['./glow'], 'exports["./glow"] entry').toBeDefined()
+    expect(p.exports['./glow'].import).toBe('./dist/glow.js')
+    expect(p.exports['./glow'].types).toBe('./dist/glow.d.ts')
+  })
+
+  it('glow is built into dist/ (prepare/build ran)', () => {
+    expect(existsSync(distPath('glow')), 'dist/glow.js must exist — run `npm run build`').toBe(true)
   })
 })
