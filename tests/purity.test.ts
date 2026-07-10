@@ -31,7 +31,9 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 // Pure subpaths per ADR-0003 Amendment 1 — must remain DOM-free.
-const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font'] as const
+// SH2-13 adds 'name-entry' (the shared keyboard initials-entry reducer): a
+// pure string reducer with no DOM surface at all, so it joins the fence.
+const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'name-entry'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
