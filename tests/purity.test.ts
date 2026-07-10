@@ -31,7 +31,14 @@ import { existsSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 // Pure subpaths per ADR-0003 Amendment 1 — must remain DOM-free.
-const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font'] as const
+// SH2-12: `pause` (the game-agnostic frozen-frame gate) joins the pure core — it
+// is a boolean toggle + a thunk-selector with no DOM, so the guard polices it.
+const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'pause'] as const
+
+// Browser subpaths (ADR-0003) — explicitly flagged as canvas/DOM-touching and so
+// EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel
+// + keybind card). These must never be added to PURE_SUBPATHS.
+const BROWSER_SUBPATHS = ['esc-overlay'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -99,5 +106,38 @@ describe('purity guard — package exports declare font (AC-1)', () => {
     expect(pkg.exports['./font'], 'exports["./font"] entry').toBeDefined()
     expect(pkg.exports['./font'].import).toBe('./dist/font.js')
     expect(pkg.exports['./font'].types).toBe('./dist/font.d.ts')
+  })
+})
+
+describe('SH2-12 — pause (pure) + esc-overlay (browser) subpaths', () => {
+  const pkg = () =>
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+
+  it('pause is policed as PURE and esc-overlay is NOT (browser-exempt)', () => {
+    // The classification itself is the invariant: esc-overlay must never be added
+    // to the pure set (it legitimately draws to a canvas), and pause must never be
+    // dropped from it (it must stay DOM-free forever).
+    expect(PURE_SUBPATHS as readonly string[]).toContain('pause')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('esc-overlay')
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('esc-overlay')
+  })
+
+  it('exports["./pause"] maps to the built pure ESM + types', () => {
+    const p = pkg()
+    expect(p.exports['./pause'], 'exports["./pause"] entry').toBeDefined()
+    expect(p.exports['./pause'].import).toBe('./dist/pause.js')
+    expect(p.exports['./pause'].types).toBe('./dist/pause.d.ts')
+  })
+
+  it('exports["./esc-overlay"] maps to the built browser ESM + types', () => {
+    const p = pkg()
+    expect(p.exports['./esc-overlay'], 'exports["./esc-overlay"] entry').toBeDefined()
+    expect(p.exports['./esc-overlay'].import).toBe('./dist/esc-overlay.js')
+    expect(p.exports['./esc-overlay'].types).toBe('./dist/esc-overlay.d.ts')
+  })
+
+  it('every browser subpath is actually built into dist/', () => {
+    const missing = BROWSER_SUBPATHS.filter((s) => !existsSync(distPath(s)))
+    expect(missing, `missing built browser subpaths in dist/: ${missing.join(', ')}`).toEqual([])
   })
 })
