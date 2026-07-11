@@ -40,8 +40,9 @@ const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'name-entry
 // Browser subpaths (ADR-0003) — explicitly flagged as canvas/DOM-touching and so
 // EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel
 // + keybind card); SH2-8 adds `glow` (the neon-vector primitive: withGlow +
-// glowPolyline). These must never be added to PURE_SUBPATHS.
-const BROWSER_SUBPATHS = ['esc-overlay', 'glow'] as const
+// glowPolyline). SH2-10 adds `view` (resizeToDisplay mutates a canvas element's
+// backing store + CSS box). These must never be added to PURE_SUBPATHS.
+const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -165,5 +166,30 @@ describe('SH2-8 — glow (browser subpath)', () => {
 
   it('glow is built into dist/ (prepare/build ran)', () => {
     expect(existsSync(distPath('glow')), 'dist/glow.js must exist — run `npm run build`').toBe(true)
+  })
+})
+
+describe('SH2-10 — view (browser subpath)', () => {
+  const pkg = () =>
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+
+  it('view is classified BROWSER (canvas-exempt) and NEVER policed as pure', () => {
+    // resizeToDisplay writes canvas.width/height + canvas.style — it legitimately
+    // touches a canvas element, so `view` must be browser-exempt and must never be
+    // smuggled into the DOM-free pure set (its `letterbox` half is pure math, but a
+    // subpath is classified by its dirtiest export).
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('view')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('view')
+  })
+
+  it('exports["./view"] maps to the built browser ESM + types', () => {
+    const p = pkg()
+    expect(p.exports['./view'], 'exports["./view"] entry').toBeDefined()
+    expect(p.exports['./view'].import).toBe('./dist/view.js')
+    expect(p.exports['./view'].types).toBe('./dist/view.d.ts')
+  })
+
+  it('view is built into dist/ (prepare/build ran)', () => {
+    expect(existsSync(distPath('view')), 'dist/view.js must exist — run `npm run build`').toBe(true)
   })
 })
