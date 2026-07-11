@@ -41,8 +41,9 @@ const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'name-entry
 // EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel
 // + keybind card); SH2-8 adds `glow` (the neon-vector primitive: withGlow +
 // glowPolyline). SH2-10 adds `view` (resizeToDisplay mutates a canvas element's
-// backing store + CSS box). These must never be added to PURE_SUBPATHS.
-const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view'] as const
+// backing store + CSS box). SH2-16 adds `audio` (the WebAudio SFX engine — touches
+// AudioContext, a browser global). These must never be added to PURE_SUBPATHS.
+const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view', 'audio'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -191,5 +192,50 @@ describe('SH2-10 — view (browser subpath)', () => {
 
   it('view is built into dist/ (prepare/build ran)', () => {
     expect(existsSync(distPath('view')), 'dist/view.js must exist — run `npm run build`').toBe(true)
+  })
+})
+
+describe('SH2-16 — audio (browser subpath)', () => {
+  const pkg = () =>
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+
+  it('audio is classified BROWSER (AudioContext-exempt) and NEVER policed as pure', () => {
+    // The engine touches AudioContext (a browser global) — like glow/view it must be
+    // browser-exempt and must never be smuggled into the DOM-free pure set. The pure
+    // core (math3d/rng/highscore/loop/font/…) still fails the guard on any DOM ref;
+    // that the detector has teeth is proven by the "detector is honest" block above.
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('audio')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('audio')
+  })
+
+  it('exports["./audio"] maps to the built browser ESM + types (AC-1)', () => {
+    const p = pkg()
+    expect(p.exports['./audio'], 'exports["./audio"] entry').toBeDefined()
+    expect(p.exports['./audio'].import).toBe('./dist/audio.js')
+    expect(p.exports['./audio'].types).toBe('./dist/audio.d.ts')
+  })
+
+  it('audio is built into dist/ (prepare/build ran)', () => {
+    expect(existsSync(distPath('audio')), 'dist/audio.js must exist — run `npm run build`').toBe(
+      true,
+    )
+  })
+
+  it('the package version is bumped past the 0.11.0 baseline this story starts from (AC-1)', () => {
+    // AC-1 requires a version bump (design/practice: 0.11.0 → 0.12.0). Compared as a
+    // semver triple so any bump ≥ 0.12.0 satisfies it — not pinned to an exact number.
+    const parse = (v: string): [number, number, number] => {
+      const [maj, min, pat] = v.split('.').map((n) => Number.parseInt(n, 10))
+      return [maj, min, pat]
+    }
+    const gt = (a: [number, number, number], b: [number, number, number]): boolean => {
+      for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i]
+      return false
+    }
+    const version = pkg().version as string
+    expect(/^\d+\.\d+\.\d+$/.test(version), `version "${version}" must be plain semver`).toBe(true)
+    expect(gt(parse(version), [0, 11, 0]), `version "${version}" must be bumped past 0.11.0`).toBe(
+      true,
+    )
   })
 })
