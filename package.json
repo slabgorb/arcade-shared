@@ -52,6 +52,10 @@
       "types": "./dist/glow.d.ts",
       "import": "./dist/glow.js"
     },
+    "./view": {
+      "types": "./dist/view.d.ts",
+      "import": "./dist/view.js"
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
