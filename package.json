@@ -1,6 +1,6 @@
 {
   "name": "@arcade/shared",
-  "version": "0.10.0",
+  "version": "0.12.1",
   "description": "Shared library for the slabgorb browser vector-arcade games (ADR-0001). Consumed as a version-pinned git-URL dependency.",
   "type": "module",
   "license": "MIT",
@@ -51,6 +51,14 @@
     "./glow": {
       "types": "./dist/glow.d.ts",
       "import": "./dist/glow.js"
+    },
+    "./view": {
+      "types": "./dist/view.d.ts",
+      "import": "./dist/view.js"
+    },
+    "./audio": {
+      "types": "./dist/audio.d.ts",
+      "import": "./dist/audio.js"
     },
     "./package.json": "./package.json"
   },
