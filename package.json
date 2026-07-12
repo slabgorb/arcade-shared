@@ -1,6 +1,6 @@
 {
   "name": "@arcade/shared",
-  "version": "0.12.1",
+  "version": "0.13.1",
   "description": "Shared library for the slabgorb browser vector-arcade games (ADR-0001). Consumed as a version-pinned git-URL dependency.",
   "type": "module",
   "license": "MIT",
