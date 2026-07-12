@@ -35,15 +35,37 @@ import { fileURLToPath } from 'node:url'
 // pure string reducer with no DOM surface at all, so it joins the fence.
 // SH2-12: `pause` (the game-agnostic frozen-frame gate) joins the pure core — it
 // is a boolean toggle + a thunk-selector with no DOM, so the guard polices it.
-const PURE_SUBPATHS = ['math3d', 'rng', 'highscore', 'loop', 'font', 'name-entry', 'pause'] as const
+//
+// ── lb2-2 / ADR-0004: `highscore` LEAVES the pure set ────────────────────────
+// ADR-0004 installs the cross-origin score publish inside `save()`/`load()` in
+// makeHighScoreStorage — and that publish writes `document.cookie`. `highscore`
+// therefore touches a DOM global and can no longer be policed as pure.
+//
+// This is FORCED, not chosen. The AC requires the four shipped games to be fixed by a
+// version bump with zero code changes, which means the default cookie transport must be
+// wired inside the factory the games already call. There is no arrangement in which
+// `highscore`'s import closure stays DOM-free AND the games need no code.
+//
+// It follows the rule this guard already states for `view` (SH2-10): **a subpath is
+// classified by its dirtiest export.** The pure table logic (qualifiesForHighScore /
+// insertHighScore / highScoreKey / isHighScoreRow) is unchanged and still exported —
+// but the subpath as a whole now reaches the DOM, and saying otherwise would make the
+// fence a lie. Reclassifying is the honest move; the alternative (hiding `document`
+// behind an internal import to keep the PURE label) is exactly the smuggling the
+// transitive guard below now forbids.
+//
+// Raised to the Architect as a blocking Delivery Finding: ADR-0004 never mentions the
+// ADR-0003 purity fence, and this is a real consequence of it that wants ratifying.
+const PURE_SUBPATHS = ['math3d', 'rng', 'loop', 'font', 'name-entry', 'pause'] as const
 
 // Browser subpaths (ADR-0003) — explicitly flagged as canvas/DOM-touching and so
 // EXEMPT from the purity guard. SH2-12 adds `esc-overlay` (draws the pause panel
 // + keybind card); SH2-8 adds `glow` (the neon-vector primitive: withGlow +
 // glowPolyline). SH2-10 adds `view` (resizeToDisplay mutates a canvas element's
 // backing store + CSS box). SH2-16 adds `audio` (the WebAudio SFX engine — touches
-// AudioContext, a browser global). These must never be added to PURE_SUBPATHS.
-const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view', 'audio'] as const
+// AudioContext, a browser global). lb2-2 adds `highscore` (save()/load() publish the
+// top score to document.cookie — ADR-0004). These must never be added to PURE_SUBPATHS.
+const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view', 'audio', 'highscore'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -99,6 +121,100 @@ describe('purity guard — every pure subpath is built and DOM-free (AC-2)', () 
       }
     }
     expect(violations, violations.join('\n')).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// lb2-2 — the fence must be TRANSITIVE, or it can be walked around
+// ---------------------------------------------------------------------------
+//
+// The guard above greps ONE file. That is a loophole: move `document.cookie` into
+// `src/cookie.ts`, import it from a "pure" subpath, and dist/<pure>.js contains no
+// `document` token at all — the guard passes while the subpath drags the DOM in behind
+// it. Nothing caught that before, because no pure subpath had any relative imports.
+// lb2-2 is the first story with a reason to want one, so the fence gets closed now:
+// a pure subpath must be DOM-free through its WHOLE import closure, not just its own
+// top-level text.
+
+/** Follow relative imports from a built dist file and return every .js in its closure. */
+function importClosure(entry: string): string[] {
+  const seen = new Set<string>()
+  const queue = [entry]
+
+  while (queue.length > 0) {
+    const file = queue.pop() as string
+    if (seen.has(file) || !existsSync(file)) continue
+    seen.add(file)
+
+    const source = readFileSync(file, 'utf8')
+    const re = /\bfrom\s+['"](\.[^'"]*)['"]/g
+    let m: RegExpExecArray | null
+    while ((m = re.exec(source)) !== null) {
+      queue.push(fileURLToPath(new URL(m[1], `file://${file}`)))
+    }
+  }
+  return [...seen]
+}
+
+describe('purity guard — the fence is transitive (lb2-2)', () => {
+  it('the closure walker is honest — it follows a relative import', () => {
+    // Prove the walker actually traverses, so the guard below cannot pass vacuously by
+    // silently finding nothing. esc-overlay imports './font.js' (SH2-12).
+    const closure = importClosure(distPath('esc-overlay'))
+    expect(closure.length, 'esc-overlay must pull font.js into its closure').toBeGreaterThan(1)
+    expect(closure.some((f) => f.endsWith('font.js'))).toBe(true)
+  })
+
+  it('no pure subpath reaches a DOM global THROUGH an import either', () => {
+    const violations: string[] = []
+    for (const sub of PURE_SUBPATHS) {
+      for (const file of importClosure(distPath(sub))) {
+        for (const g of domGlobalsIn(readFileSync(file, 'utf8'))) {
+          const via = file.endsWith(`${sub}.js`) ? 'directly' : `via ${file.split('/').pop()}`
+          violations.push(`pure subpath \`${sub}\` references DOM global \`${g}\` ${via}`)
+        }
+      }
+    }
+    expect(violations, violations.join('\n')).toEqual([])
+  })
+})
+
+describe('lb2-2 / ADR-0004 — highscore is reclassified as a BROWSER subpath', () => {
+  it('highscore is browser-exempt and NEVER policed as pure', () => {
+    // save()/load() publish the top score to document.cookie so the lobby can read it
+    // across the origin split. A subpath is classified by its dirtiest export, so
+    // highscore belongs with view/glow/audio — and must never be smuggled back into the
+    // DOM-free pure set to make a red guard go green.
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('highscore')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('highscore')
+  })
+
+  it('still exports ./highscore as built ESM + types — the games’ import is unchanged', () => {
+    const pkg = JSON.parse(
+      readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    )
+    expect(pkg.exports['./highscore'].import).toBe('./dist/highscore.js')
+    expect(pkg.exports['./highscore'].types).toBe('./dist/highscore.d.ts')
+  })
+
+  it('the package version is bumped past the 0.12.1 baseline this story starts from', () => {
+    // The lobby cannot consume the new read until a tag ships: games and the lobby pin
+    // @arcade/shared as a git-URL TAG, so unreleased source is invisible to them.
+    const parse = (v: string): [number, number, number] => {
+      const [maj, min, pat] = v.split('.').map((n) => Number.parseInt(n, 10))
+      return [maj, min, pat]
+    }
+    const gt = (a: [number, number, number], b: [number, number, number]): boolean => {
+      for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i]
+      return false
+    }
+    const version = JSON.parse(
+      readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+    ).version as string
+    expect(/^\d+\.\d+\.\d+$/.test(version), `version "${version}" must be plain semver`).toBe(true)
+    expect(gt(parse(version), [0, 12, 1]), `version "${version}" must be bumped past 0.12.1`).toBe(
+      true,
+    )
   })
 })
 
