@@ -10,7 +10,7 @@ exports they can import.
 Consumed as a version-pinned git dependency:
 
 ```json
-"@arcade/shared": "github:slabgorb/arcade-shared#v0.12.0"
+"@arcade/shared": "github:slabgorb/arcade-shared#v0.13.1"
 ```
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
@@ -19,12 +19,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 Eligibility bar, per ADR-0001: only code that is byte- or algorithm-identical across
 **two or more** games belongs here.
 
-> **Note on the version history.** Two tags were cut outside the normal release flow:
-> `v0.11.0` and `v0.12.0` are tagged on their feature-branch commits rather than on a
-> release merge, so they are not reachable from `main` (which still reads `v0.10.0`).
-> Both tags contain the correct code and resolve correctly for consumers — every game
-> pinning them installs working builds — but `main` does not yet reflect them. There is
-> also **no `v0.8.0`**: the pause / esc-overlay work intended for it shipped as `v0.9.0`.
+> **Note on the version history.** `v0.11.0` and `v0.12.0` were cut outside the normal
+> release flow — tagged on their feature-branch commits rather than on a release merge —
+> so neither is reachable from `main`. Both contain the correct code and resolve correctly
+> for consumers: every game pinning them installs a working build. `main` has since caught
+> up through the normal flow and now reads `v0.13.1`.
+>
+> Two versions were never tagged at all. There is **no `v0.8.0`** — the pause /
+> esc-overlay work intended for it shipped as `v0.9.0` — and **no `v0.13.0`**, whose
+> cross-origin high-score work shipped as `v0.13.1`.
+
+## [0.13.2] - 2026-07-12
+
+No API changes. Documentation only.
+
+## [0.13.1] - 2026-07-12
+
+### Added
+- **`/highscore` publishes each game's top score to the rest of the arcade.** Alongside
+  the existing save, the table's maximum is written to a cookie scoped to the shared
+  parent domain — which is how the lobby, on its own origin, can read a score that a game
+  saved on its (ADR-0004). `load()` republishes as well, so the four already-shipped games
+  self-heal with no code change of their own.
+
+### Changed
+- **`/highscore` is now a browser subpath, not a pure one.** The default cookie transport
+  sits inside the factory the games already call, so its import closure can no longer be
+  DOM-free. This was forced by the requirement, not chosen. `localStorage` stays
+  authoritative and unmigrated, the transport is injectable, and a transport that throws
+  never costs a player their score.
+
+## [0.12.1] - 2026-07-12
+
+### Added
+- `/audio` reached `main` through the normal release flow. The subpath itself is unchanged
+  from the `v0.12.0` feature-branch tag documented below.
 
 ## [0.12.0] - 2026-07-11
 
