@@ -21,7 +21,7 @@ export function makeFakeStorage(initial: Record<string, string> = {}): Storage {
       return store.size
     },
   }
-  return storage as unknown as Storage
+  return storage as Storage
 }
 
 /** A `Storage` whose setItem always throws — the quota-exceeded / full-disk path. */

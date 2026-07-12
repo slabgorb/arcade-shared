@@ -204,6 +204,114 @@ describe('publish — one cookie per game', () => {
 })
 
 // ---------------------------------------------------------------------------
+// publish(gameId, null) — the transport can say "this game has NO score"
+// ---------------------------------------------------------------------------
+//
+// A transport that can only ever WRITE a number cannot express absence, and absence then
+// becomes silence — leaving a stale cookie behind that outlives the table it was derived
+// from. `null` is how the caller says "the board is empty"; it must CLEAR.
+
+describe('publish(null) — clears the published score', () => {
+  it('removes an existing cookie', () => {
+    const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
+    installBrowser(jar, PROD_TEMPEST)
+
+    cookieTopScoreTransport.publish('tempest', null)
+
+    expect(jar.values()['arcade-hi-tempest']).toBeUndefined()
+    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+  })
+
+  it('expires the cookie on the SAME Domain and Path it was set with', () => {
+    // A browser only deletes a cookie when the expiring write matches the original's Domain
+    // and Path. A clear that omits Domain silently does nothing on a subdomain — it would
+    // look like it worked and leave the stale score in place.
+    const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
+    installBrowser(jar, PROD_TEMPEST)
+
+    cookieTopScoreTransport.publish('tempest', null)
+
+    const { raw } = jar.writes[0]
+    expect(attr(raw, 'domain')).toBe('slabgorb.com')
+    expect(attr(raw, 'path')).toBe('/')
+    expect(Number(attr(raw, 'max-age'))).toBeLessThanOrEqual(0)
+  })
+
+  it('does not disturb a sibling game', () => {
+    const jar = makeCookieJar({ 'arcade-hi-tempest': '50000', 'arcade-hi-star-wars': '8000' })
+    installBrowser(jar, PROD_TEMPEST)
+
+    cookieTopScoreTransport.publish('tempest', null)
+
+    expect(jar.values()).toEqual({ 'arcade-hi-star-wars': '8000' })
+  })
+
+  it('is a harmless no-op when there was no cookie to begin with', () => {
+    const jar = makeCookieJar()
+    installBrowser(jar, PROD_TEMPEST)
+
+    expect(() => cookieTopScoreTransport.publish('tempest', null)).not.toThrow()
+    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+  })
+
+  it('a bogus score is NOT treated as "no score" — it leaves the cookie untouched', () => {
+    // The distinction that matters: `null` is a claim about the board ("it is empty").
+    // `0` / `NaN` / `-1` are caller errors. An error must not be allowed to wipe a good
+    // published score.
+    const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
+    installBrowser(jar, PROD_TEMPEST)
+
+    for (const bogus of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
+      cookieTopScoreTransport.publish('tempest', bogus)
+    }
+
+    expect(jar.values()['arcade-hi-tempest']).toBe('50000')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// gameId is interpolated into a cookie string — it must be a slug, not a payload
+// ---------------------------------------------------------------------------
+
+describe('a hostile gameId cannot inject cookie attributes', () => {
+  it('refuses a gameId carrying a `;` (attribute injection)', () => {
+    // `;` and `=` are the cookie string's delimiters. Interpolating them unchecked lets a
+    // caller smuggle in attributes — e.g. a Domain of their choosing — and mangles the
+    // cookie's name and value. Every real id is a plain slug.
+    const jar = makeCookieJar()
+    installBrowser(jar, PROD_TEMPEST)
+
+    cookieTopScoreTransport.publish('x; Domain=evil.example', 9000)
+
+    expect(jar.writes, 'nothing may be written at all').toHaveLength(0)
+    expect(jar.values()).toEqual({})
+  })
+
+  it('refuses ids with `=`, whitespace, or an empty string, and reads null for them', () => {
+    const jar = makeCookieJar({ 'arcade-hi-tempest': '9000' })
+    installBrowser(jar, PROD_TEMPEST)
+
+    for (const hostile of ['a=b', 'has space', '', 'UPPER', 'semi;colon']) {
+      cookieTopScoreTransport.publish(hostile, 9000)
+      expect(cookieTopScoreTransport.read(hostile), `read(${JSON.stringify(hostile)})`).toBeNull()
+    }
+
+    expect(jar.values(), 'the real cookie is untouched').toEqual({ 'arcade-hi-tempest': '9000' })
+  })
+
+  it('still accepts every real game id in the cabinet', () => {
+    // The guard must not be so tight that it rejects the actual games.
+    const jar = makeCookieJar()
+    installBrowser(jar, PROD_TEMPEST)
+
+    for (const id of ['tempest', 'star-wars', 'asteroids', 'battlezone', 'red-baron']) {
+      cookieTopScoreTransport.publish(id, 1234)
+      expect(cookieTopScoreTransport.read(id), id).toBe(1234)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // read — finding OUR value in a jar we do not control
 // ---------------------------------------------------------------------------
 

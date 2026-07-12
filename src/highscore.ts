@@ -1,4 +1,12 @@
-// @arcade/shared/highscore — the high-score TABLE logic + localStorage seam.
+// @arcade/shared/highscore — the high-score TABLE logic + its TWO persistence seams:
+// the localStorage table (authoritative) and the cross-origin score cookie (derived).
+//
+// NOTE: this is a BROWSER subpath, not a pure one (ADR-0003's fence, tests/purity.test.ts).
+// It was pure until lb2-2: `save()`/`load()` now write `document.cookie`, so the subpath
+// touches the DOM and is classified by its dirtiest export. The table logic below
+// (qualifiesForHighScore / insertHighScore / highScoreKey / isHighScoreRow) is still pure
+// and side-effect-free — but the module as a whole is not, and saying otherwise would make
+// the purity fence a lie.
 //
 // SH-4 (ADR-0001) extraction. tempest, star-wars, and asteroids each shipped a
 // logic-identical high-score table (src/core/highscore.ts) + persistence seam
@@ -18,10 +26,21 @@
 //   - `highScoreKey` + `isHighScoreRow` are what the LOBBY imports — the same key
 //     and shape the games write — so the tile no longer re-derives them by hand.
 //
-// Pure shared logic: no rendering, no game state. The persistence seam is the one
-// IO surface (localStorage), and it degrades gracefully on every failure mode
-// (missing / corrupt / unavailable / quota-exceeded) — a game keeps playing,
-// scores just don't persist.
+// No rendering, no game state. There are TWO IO surfaces:
+//
+//   localStorage  the game's own high-score TABLE. Origin-scoped, authoritative, and
+//                 never migrated. This is the source of truth.
+//   document.cookie  the top score alone, published to the shared parent domain so the
+//                 lobby — which lives on a DIFFERENT ORIGIN and therefore cannot read the
+//                 table — can show it on a tile (lb2-2 / ADR-0004, below).
+//
+// The cookie is DERIVED from the table and mirrors it in both directions, so it is always
+// disposable: losing it costs nothing (the next load republishes it) and it can never
+// outlive the board it came from (an empty table clears it).
+//
+// Both seams degrade gracefully on every failure mode (missing / corrupt / unavailable /
+// quota-exceeded / no DOM / a hostile document) — a game keeps playing, scores just don't
+// persist, and a tile that cannot be trusted reads NO SCORE rather than a wrong number.
 
 /** Board depth — the classic 10-deep arcade ladder. The single source of truth
  *  (AC-4): no game redeclares it. */
@@ -137,9 +156,17 @@ export function makeHighScoreRowGuard<DomainKey extends string>(
 // cabinet onto one origin on COST, not merit: swapping the cookie for same-origin
 // localStorage (or a fetch) must remain a one-adapter change.
 
-/** How a game's top score gets across the origin boundary to the lobby. */
+/**
+ * How a game's top score gets across the origin boundary to the lobby.
+ *
+ * `publish(gameId, null)` means "this game has NO score" and must CLEAR the published
+ * value — it is not the same as declining to publish. That distinction is load-bearing:
+ * the cookie is derived from the table, and derivation is a total function. If the table
+ * is empty, the derived value is *no score*, and a transport with no way to say so leaves
+ * a stale number behind that outlives the board it came from.
+ */
 export interface TopScoreTransport {
-  publish(gameId: string, score: number): void
+  publish(gameId: string, score: number | null): void
   read(gameId: string): number | null
 }
 
@@ -147,6 +174,16 @@ export interface TopScoreTransport {
  *  clobber a sibling's score via a read-modify-write on a shared cookie. */
 function topScoreCookieName(gameId: string): string {
   return `arcade-hi-${gameId}`
+}
+
+// `gameId` is interpolated straight into a cookie string, where `;` and `=` are the
+// delimiters — so an id carrying either would inject cookie ATTRIBUTES rather than name a
+// cookie. Every real id is a plain slug ('tempest', 'star-wars'), and today they are all
+// hardcoded constants; but this is a shared library's public API and nothing in the
+// signature stops a caller passing something dynamic. Reject anything that is not a slug
+// instead of trusting the caller.
+function isValidGameId(gameId: string): boolean {
+  return /^[a-z0-9][a-z0-9-]*$/.test(gameId)
 }
 
 // Browsers cap cookie persistence at 400 days and silently clamp anything longer.
@@ -191,6 +228,13 @@ function getLocation(): Location | null {
 // The cookie must be scoped to the REGISTRABLE DOMAIN or a sibling subdomain cannot read
 // it and the whole fix is inert. `tempest.slabgorb.com` -> `slabgorb.com`.
 //
+// ASSUMPTION: the cabinet lives on a single-label public suffix (`slabgorb.com`), so the
+// registrable domain is the last two labels. This is deliberately NOT a public-suffix-list
+// implementation — on a multi-part suffix (`arcade.example.co.uk`) it would yield `co.uk`,
+// which every browser rejects, and the cookie simply would not be set. That fails SAFE (no
+// cookie -> NO SCORE, never a wrong number), so the assumption costs a feature, not
+// correctness. Revisit only if the arcade ever moves to such a domain.
+//
 // Returns null when the Domain attribute must be OMITTED:
 //   - localhost (`just serve`, six ports): cookies ignore the port, so a host-only cookie
 //     is ALREADY shared across all six dev servers. `Domain=localhost` is redundant at
@@ -205,13 +249,15 @@ function registrableDomain(hostname: string): string | null {
   return labels.slice(-2).join('.')
 }
 
-function buildTopScoreCookie(name: string, score: number, page: Location | null): string {
-  const parts = [
-    `${name}=${score}`,
-    'Path=/',
-    'SameSite=Lax',
-    `Max-Age=${TOP_SCORE_MAX_AGE_SECONDS}`,
-  ]
+// `score: null` builds the DELETION form of the same cookie. A browser only removes a
+// cookie when the expiring write carries the SAME Domain and Path as the original, so the
+// two forms must be built from one place — a clear that quietly misses on Domain would
+// leave the stale score sitting there while appearing to work.
+function buildTopScoreCookie(name: string, score: number | null, page: Location | null): string {
+  const parts =
+    score === null
+      ? [`${name}=`, 'Path=/', 'SameSite=Lax', 'Max-Age=0']
+      : [`${name}=${score}`, 'Path=/', 'SameSite=Lax', `Max-Age=${TOP_SCORE_MAX_AGE_SECONDS}`]
 
   const domain = page ? registrableDomain(page.hostname) : null
   if (domain) parts.push(`Domain=${domain}`)
@@ -224,8 +270,12 @@ function buildTopScoreCookie(name: string, score: number, page: Location | null)
 
 /** The default transport: one cookie per game on the shared parent domain. */
 export const cookieTopScoreTransport: TopScoreTransport = {
-  publish(gameId: string, score: number): void {
-    if (!isPublishableScore(score)) return
+  publish(gameId: string, score: number | null): void {
+    if (!isValidGameId(gameId)) return
+    // A bogus score (0, negative, NaN, Infinity, fractional) is a caller error, not an
+    // assertion that the game has no score — decline it without touching the cookie.
+    // Only an explicit `null` means "no score", and that CLEARS.
+    if (score !== null && !isPublishableScore(score)) return
 
     const doc = getDocument()
     if (!doc) return
@@ -238,6 +288,8 @@ export const cookieTopScoreTransport: TopScoreTransport = {
   },
 
   read(gameId: string): number | null {
+    if (!isValidGameId(gameId)) return null
+
     const doc = getDocument()
     if (!doc) return null
 
@@ -315,11 +367,19 @@ export function makeHighScoreStorage<E extends HighScoreEntryBase>(
   // This is the choke point ADR-0004 targets: every game already calls this factory
   // exactly once, so installing the publish HERE fixes tempest / star-wars / asteroids /
   // battlezone with a version bump and no game-side code at all.
+  //
+  // The cookie MIRRORS the table in BOTH directions. An empty board publishes `null`,
+  // which CLEARS the cookie — it does not merely decline to write. Skipping the clear is
+  // what let a stale score outlive the table it came from: the player's board was gone
+  // (quota eviction, an ITP purge, a cleared localStorage) while the cookie kept
+  // advertising a high score for up to 400 days, and replaying the game could not fix it,
+  // because a load with an empty table published nothing. That is a tile showing a number
+  // the game itself denies — the exact defect this story exists to remove. ADR-0004 says
+  // the cookie is "fully derivable from the table"; derivation is a TOTAL function, and
+  // the derived value of an empty table is NO SCORE.
   function publishTop(table: readonly E[]): void {
-    const top = topScoreOf(table)
-    if (top === null) return
     try {
-      transport.publish(gameId, top)
+      transport.publish(gameId, topScoreOf(table))
     } catch {
       // The cookie is a cache; the player's scores are not. A transport that blows up
       // must never cost a score or crash a game.
@@ -327,8 +387,25 @@ export function makeHighScoreStorage<E extends HighScoreEntryBase>(
     }
   }
 
+  function parseTable(raw: string): E[] {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (!Array.isArray(parsed)) {
+        console.warn(`[highscore] ${key} data is not a table array; ignoring`)
+        return []
+      }
+      return parsed.filter(validator)
+    } catch {
+      console.warn(`[highscore] ${key} data is corrupt JSON; ignoring`)
+      return []
+    }
+  }
+
   function load(): E[] {
     const storage = getStorage()
+    // Storage is unreachable (node, private mode), so we cannot know what the table says.
+    // Leave the cookie ALONE: silence is not evidence of an empty board, and clearing on a
+    // failed read would throw away a perfectly good published score.
     if (!storage) return []
 
     let raw: string | null
@@ -337,24 +414,11 @@ export function makeHighScoreStorage<E extends HighScoreEntryBase>(
     } catch {
       return []
     }
-    if (raw === null) return []
 
-    let rows: E[]
-    try {
-      const parsed: unknown = JSON.parse(raw)
-      if (!Array.isArray(parsed)) {
-        console.warn(`[highscore] ${key} data is not a table array; ignoring`)
-        return []
-      }
-      rows = parsed.filter(validator)
-    } catch {
-      console.warn(`[highscore] ${key} data is corrupt JSON; ignoring`)
-      return []
-    }
-
-    // Republish on every load. This is what makes the cookie self-healing: it is fully
-    // derivable from the table, so an evicted (Safari ITP), cleared, or stale cookie is
-    // corrected by the authoritative table on the player's very next visit to the game.
+    // Whatever we return here IS the board the player sees — a missing key and corrupt
+    // JSON both mean an empty board. Republish on every load so the cookie tracks it:
+    // that heals an evicted or stale cookie upward, and clears a zombie one downward.
+    const rows = raw === null ? [] : parseTable(raw)
     publishTop(rows)
     return rows
   }

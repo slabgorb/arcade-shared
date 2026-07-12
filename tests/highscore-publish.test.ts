@@ -29,7 +29,12 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { makeCookieJar, locationStub, PROD_TEMPEST, type CookieJar } from './helpers/cookie-jar'
 import { makeFakeStorage, makeQuotaStorage } from './helpers/storage-stub'
-import { makeHighScoreStorage, makeHighScoreRowGuard, highScoreKey } from '../src/highscore'
+import {
+  makeHighScoreStorage,
+  makeHighScoreRowGuard,
+  highScoreKey,
+  cookieTopScoreTransport,
+} from '../src/highscore'
 
 const guard = makeHighScoreRowGuard('level')
 const KEY = highScoreKey('tempest')
@@ -204,6 +209,94 @@ describe('load() — republishes on every game load (self-heal)', () => {
     makeHighScoreStorage('tempest', guard).load()
 
     expect(jar.values()[COOKIE]).toBe('4200')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The cookie may never OUTLIVE the table it is derived from (the zombie score)
+// ---------------------------------------------------------------------------
+//
+// The suite used to test only one direction — cookie gone, table alive -> republish — and
+// that asymmetry hid a real bug. The mirror case is the dangerous one: the table is gone
+// and the cookie lives on, so the lobby advertises a high score the game itself denies,
+// for up to 400 days, and replaying the game could not fix it.
+//
+// ADR-0004:38 calls the cookie "fully derivable from the table". Derivation is a TOTAL
+// function: the derived value of an empty table is NO SCORE, and the cookie must say so.
+
+describe('load() — a table that is gone CLEARS the cookie, it does not leave a zombie', () => {
+  it('clears the cookie when the table has been evicted (quota / ITP / cleared storage)', () => {
+    // The player scored 50000 once. The browser later evicted tempest.slabgorb.com's
+    // localStorage, but the slabgorb.com cookie is separate storage and survived. The
+    // player revisits the game: the board is genuinely empty, so the tile must say so too.
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    installBrowser(jar, makeFakeStorage()) // the table is GONE
+
+    const loaded = makeHighScoreStorage('tempest', guard).load()
+
+    expect(loaded, 'the game shows an empty board').toEqual([])
+    expect(
+      jar.values()[COOKIE],
+      'the tile must not keep advertising a score the game no longer has',
+    ).toBeUndefined()
+  })
+
+  it('clears the cookie when the stored table is corrupt', () => {
+    // Corrupt JSON means load() hands the game an empty board. The tile must match the
+    // board the player actually sees, not a remembered number.
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    installBrowser(jar, makeFakeStorage({ [KEY]: '{not valid json' }))
+
+    expect(makeHighScoreStorage('tempest', guard).load()).toEqual([])
+    expect(jar.values()[COOKIE]).toBeUndefined()
+  })
+
+  it('clears the cookie when every row in the table is malformed', () => {
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    installBrowser(jar, makeFakeStorage({ [KEY]: '[{"name":"AAA"},5,null]' }))
+
+    expect(makeHighScoreStorage('tempest', guard).load()).toEqual([])
+    expect(jar.values()[COOKIE]).toBeUndefined()
+  })
+
+  it('does NOT clear a sibling game’s cookie while clearing its own', () => {
+    const jar = makeCookieJar({ [COOKIE]: '50000', 'arcade-hi-star-wars': '8000' })
+    installBrowser(jar, makeFakeStorage())
+
+    makeHighScoreStorage('tempest', guard).load()
+
+    expect(jar.values()['arcade-hi-star-wars']).toBe('8000')
+  })
+
+  it('leaves the cookie ALONE when storage is unreachable — silence is not an empty board', () => {
+    // The critical exception. In private mode / node there is no localStorage at all, so we
+    // cannot know what the table says. Clearing here would destroy a perfectly good
+    // published score on the strength of no evidence whatsoever.
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    vi.stubGlobal('document', jar.document)
+    vi.stubGlobal('localStorage', undefined)
+
+    expect(makeHighScoreStorage('tempest', guard).load()).toEqual([])
+    expect(jar.values()[COOKIE], 'an unreadable table must not destroy the cookie').toBe('50000')
+  })
+
+  it('save([]) clears the cookie — a reset board is NO SCORE, not a remembered one', () => {
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    installBrowser(jar, makeFakeStorage())
+
+    makeHighScoreStorage('tempest', guard).save([])
+
+    expect(jar.values()[COOKIE]).toBeUndefined()
+  })
+
+  it('round-trips: a cleared cookie reads back as NO SCORE, never as a stale number', () => {
+    const jar = makeCookieJar({ [COOKIE]: '50000' })
+    installBrowser(jar, makeFakeStorage())
+    expect(cookieTopScoreTransport.read('tempest'), 'precondition: the zombie is there').toBe(50000)
+
+    makeHighScoreStorage('tempest', guard).load()
+
+    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
   })
 })
 
