@@ -115,6 +115,159 @@ export function makeHighScoreRowGuard<DomainKey extends string>(
   }
 }
 
+// --- the cross-origin transport (ADR-0004) -----------------------------------
+//
+// lb2-2. The games and the lobby are DIFFERENT ORIGINS in production
+// (tempest.slabgorb.com vs arcade.slabgorb.com — six R2 buckets, six domains), and
+// localStorage is partitioned by origin. So the lobby was reading a store no game had
+// ever written, and every tile showed NO SCORE or a frozen stale number.
+//
+// The fix: a game publishes its TOP SCORE to a cookie scoped to the registrable domain
+// (`Domain=slabgorb.com`), which every subdomain can read. Cookie scoping is
+// host-suffix-based, so it walks straight through the storage partitioning that kills
+// every other same-browser option (notably Safari, which partitions localStorage
+// per-ORIGIN in defiance of its own published spec).
+//
+// The cookie is a DERIVED CACHE, never a source of truth: the localStorage table below
+// stays authoritative and unmigrated, and the cookie is republished on every load, so it
+// heals itself and cannot lose a player's scores. Losing the cookie costs nothing;
+// losing the table would cost everything, and nothing here can do that.
+//
+// The transport sits behind a narrow interface because ADR-0004 rejected collapsing the
+// cabinet onto one origin on COST, not merit: swapping the cookie for same-origin
+// localStorage (or a fetch) must remain a one-adapter change.
+
+/** How a game's top score gets across the origin boundary to the lobby. */
+export interface TopScoreTransport {
+  publish(gameId: string, score: number): void
+  read(gameId: string): number | null
+}
+
+/** The published cookie: `arcade-hi-tempest=124500`. One per game, so no game can
+ *  clobber a sibling's score via a read-modify-write on a shared cookie. */
+function topScoreCookieName(gameId: string): string {
+  return `arcade-hi-${gameId}`
+}
+
+// Browsers cap cookie persistence at 400 days and silently clamp anything longer.
+const TOP_SCORE_MAX_AGE_SECONDS = 400 * 24 * 60 * 60
+
+// A score worth publishing: a whole, positive, finite number of points. The board never
+// records anything else (`qualifiesForHighScore` rejects <= 0), so publishing a 0 would
+// render a real-looking score of zero on a tile that should honestly read NO SCORE.
+function isPublishableScore(score: number): boolean {
+  return Number.isInteger(score) && score > 0
+}
+
+// The cookie value is UNTRUSTED: any of our own subdomains can write it, the player can
+// edit it by hand, and ITP can shred it. JS number parsing is a minefield of ways to turn
+// junk into a CONFIDENT WRONG NUMBER — `Number('')` is 0, `parseInt('9000abc')` is 9000,
+// `Number('0x1F')` is 31, `Number('1e999')` is Infinity. Demanding plain digits up front
+// closes all of them at once; a wrong score on a tile is worse than no score at all.
+function parseTopScore(value: string): number | null {
+  if (!/^\d+$/.test(value)) return null
+  const score = Number(value)
+  return isPublishableScore(score) ? score : null
+}
+
+// The DOM may be absent (node, SSR) or hostile (sandboxed iframes and private mode can
+// throw on the mere act of touching document.cookie). Every path degrades to NO SCORE.
+function getDocument(): Document | null {
+  try {
+    return typeof document === 'undefined' ? null : document
+  } catch {
+    return null
+  }
+}
+
+function getLocation(): Location | null {
+  try {
+    return typeof location === 'undefined' ? null : location
+  } catch {
+    return null
+  }
+}
+
+// The cookie must be scoped to the REGISTRABLE DOMAIN or a sibling subdomain cannot read
+// it and the whole fix is inert. `tempest.slabgorb.com` -> `slabgorb.com`.
+//
+// Returns null when the Domain attribute must be OMITTED:
+//   - localhost (`just serve`, six ports): cookies ignore the port, so a host-only cookie
+//     is ALREADY shared across all six dev servers. `Domain=localhost` is redundant at
+//     best and rejected outright by some browsers, which would break the dev cabinet.
+//   - a bare hostname or a raw IP: there is no parent domain to scope to.
+function registrableDomain(hostname: string): string | null {
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) return null
+  if (/^[\d.]+$/.test(hostname) || hostname.includes(':')) return null // IPv4 / IPv6
+
+  const labels = hostname.split('.')
+  if (labels.length < 2) return null
+  return labels.slice(-2).join('.')
+}
+
+function buildTopScoreCookie(name: string, score: number, page: Location | null): string {
+  const parts = [
+    `${name}=${score}`,
+    'Path=/',
+    'SameSite=Lax',
+    `Max-Age=${TOP_SCORE_MAX_AGE_SECONDS}`,
+  ]
+
+  const domain = page ? registrableDomain(page.hostname) : null
+  if (domain) parts.push(`Domain=${domain}`)
+
+  // Secure only over https — a Secure cookie is dropped on the plain-http dev cabinet.
+  if (page?.protocol === 'https:') parts.push('Secure')
+
+  return parts.join('; ')
+}
+
+/** The default transport: one cookie per game on the shared parent domain. */
+export const cookieTopScoreTransport: TopScoreTransport = {
+  publish(gameId: string, score: number): void {
+    if (!isPublishableScore(score)) return
+
+    const doc = getDocument()
+    if (!doc) return
+
+    try {
+      doc.cookie = buildTopScoreCookie(topScoreCookieName(gameId), score, getLocation())
+    } catch {
+      // A failed publish costs a cached number, not a score. Never take the page down.
+    }
+  },
+
+  read(gameId: string): number | null {
+    const doc = getDocument()
+    if (!doc) return null
+
+    let jar: string
+    try {
+      jar = doc.cookie
+    } catch {
+      return null
+    }
+    if (typeof jar !== 'string' || jar === '') return null
+
+    // Match the cookie NAME exactly. A substring test would let `arcade-hi-star-wars`
+    // answer a lookup for `star`, and a lookalike cookie impersonate a real one.
+    const wanted = topScoreCookieName(gameId)
+    for (const pair of jar.split(';')) {
+      const eq = pair.indexOf('=')
+      if (eq === -1) continue
+      if (pair.slice(0, eq).trim() !== wanted) continue
+      return parseTopScore(pair.slice(eq + 1).trim())
+    }
+    return null
+  },
+}
+
+/** The single best score a game has published, or null when there is none to show.
+ *  This is what the LOBBY imports — its only contract with the games (ADR-0004). */
+export function readTopScore(gameId: string): number | null {
+  return cookieTopScoreTransport.read(gameId)
+}
+
 // --- the persistence factory -------------------------------------------------
 
 /** The load/save pair a game binds to its own key + row validator. */
@@ -142,8 +295,37 @@ function getStorage(): Storage | null {
 export function makeHighScoreStorage<E extends HighScoreEntryBase>(
   gameId: string,
   validator: (value: unknown) => value is E,
+  transport: TopScoreTransport = cookieTopScoreTransport,
 ): HighScoreStorage<E> {
   const key = highScoreKey(gameId)
+
+  // The board's best score, or null when there is nothing worth publishing. Takes the
+  // MAX rather than trusting table[0]: the table is written sorted, but corrupt or
+  // unsorted data must still yield the true top score instead of a lower wrong one.
+  function topScoreOf(table: readonly E[]): number | null {
+    let top: number | null = null
+    for (const entry of table) {
+      if (!Number.isFinite(entry.score)) continue
+      if (top === null || entry.score > top) top = entry.score
+    }
+    return top !== null && isPublishableScore(top) ? top : null
+  }
+
+  // Publish the derived top score across the origin boundary so the lobby can read it.
+  // This is the choke point ADR-0004 targets: every game already calls this factory
+  // exactly once, so installing the publish HERE fixes tempest / star-wars / asteroids /
+  // battlezone with a version bump and no game-side code at all.
+  function publishTop(table: readonly E[]): void {
+    const top = topScoreOf(table)
+    if (top === null) return
+    try {
+      transport.publish(gameId, top)
+    } catch {
+      // The cookie is a cache; the player's scores are not. A transport that blows up
+      // must never cost a score or crash a game.
+      console.warn(`[highscore] could not publish ${gameId}'s top score; the lobby may lag`)
+    }
+  }
 
   function load(): E[] {
     const storage = getStorage()
@@ -157,27 +339,38 @@ export function makeHighScoreStorage<E extends HighScoreEntryBase>(
     }
     if (raw === null) return []
 
+    let rows: E[]
     try {
       const parsed: unknown = JSON.parse(raw)
       if (!Array.isArray(parsed)) {
         console.warn(`[highscore] ${key} data is not a table array; ignoring`)
         return []
       }
-      return parsed.filter(validator)
+      rows = parsed.filter(validator)
     } catch {
       console.warn(`[highscore] ${key} data is corrupt JSON; ignoring`)
       return []
     }
+
+    // Republish on every load. This is what makes the cookie self-healing: it is fully
+    // derivable from the table, so an evicted (Safari ITP), cleared, or stale cookie is
+    // corrected by the authoritative table on the player's very next visit to the game.
+    publishTop(rows)
+    return rows
   }
 
   function save(table: readonly E[]): void {
     const storage = getStorage()
-    if (!storage) return
-    try {
-      storage.setItem(key, JSON.stringify(table))
-    } catch {
-      console.warn(`[highscore] could not persist ${key} (storage full or unavailable)`)
+    if (storage) {
+      try {
+        storage.setItem(key, JSON.stringify(table))
+      } catch {
+        console.warn(`[highscore] could not persist ${key} (storage full or unavailable)`)
+      }
     }
+    // Publish AFTER the table is safely written: localStorage is the source of truth and
+    // gets the first and best chance to succeed.
+    publishTop(table)
   }
 
   return { load, save }
