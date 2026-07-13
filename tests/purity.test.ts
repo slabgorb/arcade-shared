@@ -65,7 +65,11 @@ const PURE_SUBPATHS = ['math3d', 'rng', 'loop', 'font', 'name-entry', 'pause'] a
 // backing store + CSS box). SH2-16 adds `audio` (the WebAudio SFX engine — touches
 // AudioContext, a browser global). lb2-2 adds `highscore` (save()/load() publish the
 // top score to document.cookie — ADR-0004). These must never be added to PURE_SUBPATHS.
-const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view', 'audio', 'highscore'] as const
+// SH2-18 adds `synth` (the WebAudio SYNTHESIS skeleton — touches AudioContext too).
+// It is the SIBLING of `audio`, not a replacement: `audio` plays SAMPLES (.wav buffers)
+// and cannot host oscillator synthesis, which is why battlezone and red-baron could
+// never adopt it. Both are browser subpaths; neither may enter the pure set.
+const BROWSER_SUBPATHS = ['esc-overlay', 'glow', 'view', 'audio', 'highscore', 'synth'] as const
 
 // DOM/render/async-load globals a pure subpath must never reference. (rAF excluded —
 // see the deviation note above; loop legitimately owns frame scheduling.)
@@ -351,6 +355,59 @@ describe('SH2-16 — audio (browser subpath)', () => {
     const version = pkg().version as string
     expect(/^\d+\.\d+\.\d+$/.test(version), `version "${version}" must be plain semver`).toBe(true)
     expect(gt(parse(version), [0, 11, 0]), `version "${version}" must be bumped past 0.11.0`).toBe(
+      true,
+    )
+  })
+})
+
+describe('SH2-18 — synth (browser subpath)', () => {
+  const pkg = () =>
+    JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+
+  it('synth is classified BROWSER (AudioContext-exempt) and NEVER policed as pure (AC-2)', () => {
+    // The synthesis skeleton builds an AudioContext, oscillators and gain nodes — like
+    // audio/glow/view it must be browser-exempt, and must never be smuggled into the
+    // DOM-free pure set to make a red guard go green.
+    expect(BROWSER_SUBPATHS as readonly string[]).toContain('synth')
+    expect(PURE_SUBPATHS as readonly string[]).not.toContain('synth')
+  })
+
+  it('synth and audio are SIBLINGS — both shipped, neither replacing the other (AC-1)', () => {
+    // The whole premise of the story: /audio is a SAMPLE player and cannot host
+    // oscillator synthesis, so extracting /synth does not obsolete it. If a later
+    // change ever deletes ./audio in favour of ./synth, this fails — deliberately.
+    const p = pkg()
+    expect(p.exports['./audio'], './audio must survive — /synth does not replace it').toBeDefined()
+    expect(p.exports['./synth'], './synth ships alongside it').toBeDefined()
+  })
+
+  it('exports["./synth"] maps to the built browser ESM + types (AC-1)', () => {
+    const p = pkg()
+    expect(p.exports['./synth'], 'exports["./synth"] entry').toBeDefined()
+    expect(p.exports['./synth'].import).toBe('./dist/synth.js')
+    expect(p.exports['./synth'].types).toBe('./dist/synth.d.ts')
+  })
+
+  it('synth is built into dist/ (prepare/build ran)', () => {
+    expect(existsSync(distPath('synth')), 'dist/synth.js must exist — run `npm run build`').toBe(
+      true,
+    )
+  })
+
+  it('the package version is bumped past the 0.13.2 baseline this story starts from (AC-1)', () => {
+    // battlezone and red-baron pin @arcade/shared as a git-URL ref, so unreleased
+    // source is invisible to them: without a bump there is nothing for them to adopt.
+    const parse = (v: string): [number, number, number] => {
+      const [maj, min, pat] = v.split('.').map((n) => Number.parseInt(n, 10))
+      return [maj, min, pat]
+    }
+    const gt = (a: [number, number, number], b: [number, number, number]): boolean => {
+      for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] > b[i]
+      return false
+    }
+    const version = pkg().version as string
+    expect(/^\d+\.\d+\.\d+$/.test(version), `version "${version}" must be plain semver`).toBe(true)
+    expect(gt(parse(version), [0, 13, 2]), `version "${version}" must be bumped past 0.13.2`).toBe(
       true,
     )
   })
