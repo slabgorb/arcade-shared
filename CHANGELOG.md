@@ -29,6 +29,45 @@ Eligibility bar, per ADR-0001: only code that is byte- or algorithm-identical ac
 > esc-overlay work intended for it shipped as `v0.9.0` — and **no `v0.13.0`**, whose
 > cross-origin high-score work shipped as `v0.13.1`.
 
+## [0.14.0] - 2026-07-13
+
+### Added
+- **`/synth` — the WebAudio SYNTHESIS engine skeleton.** A **sibling of `/audio`, not a
+  replacement for it**: `/audio` plays SAMPLES (`.wav` buffers) and cannot host oscillator
+  synthesis, which is why the two synthesis cabinets — battlezone and red-baron — could
+  never adopt it and hand-wrote the same engine architecture twice. Both subpaths ship.
+
+  `/synth` carries the VERB and nothing else: the lazy gesture gate, the vendor-prefixed
+  `webkitAudioContext` fallback, a white-noise buffer, sustained-voice bookkeeping, and the
+  no-throw contract. Every NUMBER — each cabinet's oscillators, filters, envelopes and ROM
+  seams — stays in the game that owns it.
+
+  `createSynthEngine<N extends string>(config?)` is generic over the cabinet's voice-name
+  union, so `startVoice(name)` stays typed at the consumer.
+
+- **`withAudio(effect)` — the no-throw contract as one primitive.** It fuses the two halves
+  that must never be separated: it refuses a dead context AND swallows whatever Web Audio
+  throws. Both are required. A browser may CLOSE the context out from under a game (iOS
+  reclaiming audio, a long-backgrounded tab), after which every `createOscillator` /
+  `createGain` / `createBufferSource` throws `InvalidStateError` synchronously — and the
+  cabinets call these from inside `frame()`, ABOVE the `requestAnimationFrame` re-schedule,
+  so an escaping exception freezes rendering and input rather than merely muting the game.
+  Catching without refusing is not enough: you would still be building nodes into a corpse.
+  Sound may die; the game never does.
+
+- **Recovery from a closed context.** A closed context is discarded and the next user
+  gesture builds a fresh one, so a browser audio reclaim no longer silences a cabinet for
+  the rest of the session. The voice registry is cleared with it — a stale entry would make
+  `startVoice` a permanent no-op.
+
+- **`onRebuild(listener)`.** Fires when a new context is built (the first, and every
+  replacement). **Any consumer holding a WebAudio node OUTSIDE the voice registry — a
+  free-running hum oscillator, an approach whine, anything built once behind an
+  `if (node === null)` gate — must register a reset here**, or that node keeps referencing
+  the dead context and its build gate never re-fires: the sound dies permanently while the
+  registry voices come back. A half recovery is worse than none, because it looks like it
+  worked.
+
 ## [0.13.2] - 2026-07-12
 
 No API changes. Documentation only.
