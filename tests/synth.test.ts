@@ -130,6 +130,9 @@ class FakeAudioContext {
   static instances: FakeAudioContext[] = []
   /** Set to make createGain() throw — models a ctor that half-builds then fails. */
   static failCreateGain = false
+  /** Set to make close() REJECT. A real close() returns a promise that can reject;
+   *  discarding it with a bare `void` leaks an unhandled rejection (review round 1). */
+  static rejectClose = false
 
   readonly gains: FakeGain[] = []
   readonly oscillators: FakeOscillator[] = []
@@ -157,7 +160,9 @@ class FakeAudioContext {
   close(): Promise<void> {
     this.closeCalls++
     this.state = 'closed'
-    return Promise.resolve()
+    return FakeAudioContext.rejectClose
+      ? Promise.reject(new Error('InvalidStateError: close failed'))
+      : Promise.resolve()
   }
 
   /** A closed context throws SYNCHRONOUSLY from every factory. The real behaviour. */
@@ -208,6 +213,7 @@ beforeEach(() => {
   vi.resetModules()
   FakeAudioContext.instances = []
   FakeAudioContext.failCreateGain = false
+  FakeAudioContext.rejectClose = false
   vi.stubGlobal('AudioContext', FakeAudioContext)
   vi.stubGlobal('webkitAudioContext', FakeAudioContext)
 })
@@ -375,14 +381,50 @@ describe('a CLOSED context is treated as ABSENT — it must never freeze the gam
     expect(synth.ready(), 'a closed context is not ready — it is dead').toBe(false)
   })
 
-  it('every public method may be hammered on a closed context without throwing', async () => {
+  it('startVoice REFUSES a closed context — the builder is never even invoked', async () => {
+    // THE test the first round was missing. `withAudio` had this covered; the voice
+    // registry did not, and the gap was invisible because the old test passed a builder
+    // that never touched the context and only asserted `.not.toThrow()`.
+    //
+    // Refusing a dead context and merely CATCHING its throw are different things, and the
+    // difference IS this story: catching-without-refusing is exactly battlezone's old bug.
+    // A spy is the only way to tell them apart — so spy.
     const { createSynthEngine } = await loadSynth()
     const synth = createSynthEngine()
     synth.resume()
     await only().close()
 
+    const build = vi.fn(() => ({ stop: () => {} }))
+    expect(() => synth.startVoice('gun', build)).not.toThrow()
+    expect(build, 'a dead context must be REFUSED, not built into and caught').not.toHaveBeenCalled()
+    expect(synth.isVoiceActive('gun'), 'no voice can be running on a dead context').toBe(false)
+  })
+
+  it('stopVoice and isVoiceActive stay honest on a closed context', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    synth.startVoice('gun', () => ({ stop: () => {} }))
+    expect(synth.isVoiceActive('gun')).toBe(true)
+
+    await only().close()
+
+    // The nodes behind that voice no longer exist. Reporting it as still running is a
+    // lie, and a lie that MATTERS: a stale entry makes a later startVoice a silent no-op.
+    expect(synth.isVoiceActive('gun'), 'a voice cannot be live on a dead context').toBe(false)
+    expect(() => synth.stopVoice('gun')).not.toThrow()
+  })
+
+  it('the rest of the surface may be hammered on a closed context without throwing', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    await only().close()
+
+    // NOTE: resume() is deliberately NOT in this list — it now RECOVERS (see below), so
+    // calling it here would revive the context and the rest would no longer be hammering
+    // a corpse, which is the whole point of the test.
     expect(() => {
-      synth.resume()
       synth.withAudio(() => {})
       synth.startVoice('gun', () => ({ stop: () => {} }))
       synth.stopVoice('gun')
@@ -391,10 +433,10 @@ describe('a CLOSED context is treated as ABSENT — it must never freeze the gam
     }, 'the whole surface must degrade to silence, never to an exception').not.toThrow()
   })
 
-  it('resume() on a closed context does not leak an unhandled rejection', async () => {
-    // The real AudioContext.resume() REJECTS on a closed context. A bare
-    // `void ctx.resume()` (battlezone's spelling today) surfaces as an unhandled
-    // rejection; only `.catch()` contains it.
+  it('resume() does not leak an unhandled rejection when the context rejects', async () => {
+    // The real AudioContext.resume() REJECTS on a closed context (and can reject on a
+    // context the browser is tearing down). A bare `void ctx.resume()` — battlezone's old
+    // spelling — surfaces that as an unhandled rejection; only `.catch()` contains it.
     const rejections: unknown[] = []
     const onUnhandled = (reason: unknown) => rejections.push(reason)
     process.on('unhandledRejection', onUnhandled)
@@ -402,13 +444,91 @@ describe('a CLOSED context is treated as ABSENT — it must never freeze the gam
       const { createSynthEngine } = await loadSynth()
       const synth = createSynthEngine()
       synth.resume()
+      // Close it WITHOUT going through the engine, then drive resume() again. Whether the
+      // engine rebuilds or nudges, no rejection may escape.
       await only().close()
-      synth.resume() // hits `ctx.resume()` on a closed context → rejects
+      synth.resume()
+      synth.resume()
       await settle()
     } finally {
       process.off('unhandledRejection', onUnhandled)
     }
-    expect(rejections, 'resume() must .catch() the closed-context rejection').toEqual([])
+    expect(rejections, 'resume() must .catch() any rejection from the context').toEqual([])
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The RECOVERY contract — decided in review round 1, previously unspecified
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A browser that closes the context under memory pressure (iOS reclaiming audio, a
+// long-backgrounded tab) used to leave the cabinet silent FOREVER: `resume()` guards on
+// `ctx === null`, and a closed context is not null, so it never rebuilt — it just nudged
+// a corpse. The player keeps generating gestures and never gets sound back.
+//
+// resume() is already wired to every gesture, so it is exactly the right place to heal.
+// The contract is now: a closed context is DISCARDED and the next gesture builds a fresh
+// one. The registry must be cleared with it — its voices point at nodes that no longer
+// exist, and a stale entry would make startVoice a permanent no-op.
+
+describe('a closed context RECOVERS on the next gesture (review round 1)', () => {
+  it('the next resume() builds a FRESH context instead of nudging the corpse', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    expect(contexts()).toHaveLength(1)
+
+    await contexts()[0].close() // the browser reclaims audio
+    expect(synth.ready()).toBe(false)
+
+    synth.resume() // the player touches the controls again
+    expect(contexts(), 'a dead context must be replaced, not nudged forever').toHaveLength(2)
+    expect(synth.ready(), 'sound must come back').toBe(true)
+  })
+
+  it('effects play into the NEW context after recovery', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    await contexts()[0].close()
+    synth.resume()
+
+    const effect = vi.fn()
+    synth.withAudio(effect)
+    expect(effect).toHaveBeenCalledTimes(1)
+    expect(effect.mock.calls[0][0].context, 'must play into the LIVE context').toBe(contexts()[1])
+  })
+
+  it('the voice registry is CLEARED on recovery, so voices can actually restart', async () => {
+    // The trap in the obvious one-line fix: rebuild the context but leave `voices` alone,
+    // and startVoice sees the (dead) voice as already running and no-ops forever. The gun
+    // would never fire again — a silent failure worse than the one being fixed.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    synth.startVoice('gun', () => ({ stop: () => {} }))
+
+    await contexts()[0].close()
+    synth.resume()
+
+    const build = vi.fn(() => ({ stop: () => {} }))
+    synth.startVoice('gun', build)
+    expect(build, 'a stale registry entry must not block the voice from restarting').toHaveBeenCalledTimes(1)
+    expect(synth.isVoiceActive('gun')).toBe(true)
+  })
+
+  it('a context closed mid-life does not resurrect itself without a gesture', async () => {
+    // Recovery is gesture-driven, not spontaneous: until resume() fires, the engine stays
+    // silent. (Autoplay policy — we may not build a context on our own initiative.)
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.resume()
+    await contexts()[0].close()
+
+    synth.withAudio(() => {})
+    synth.startVoice('gun', () => ({ stop: () => {} }))
+    expect(contexts(), 'no context may be built without a gesture').toHaveLength(1)
+    expect(synth.ready()).toBe(false)
   })
 })
 
@@ -476,6 +596,30 @@ describe('a failing AudioContext constructor degrades to silence', () => {
     expect(contexts(), 'the context was constructed before createGain failed').toHaveLength(1)
     expect(contexts()[0].closeCalls, 'the half-built context must be closed, not leaked').toBe(1)
     expect(synth.ready()).toBe(false)
+  })
+
+  it('a REJECTING close() on the half-built context leaks no unhandled rejection', async () => {
+    // `close()` returns a promise. `try { void building.close() } catch {}` catches only a
+    // SYNCHRONOUS throw — an async rejection sails straight past it. That is the identical
+    // bug this file fixes for `ctx.resume()` a few lines below, and it was left unfixed
+    // here (found in review round 1). Same class, same file, same function.
+    FakeAudioContext.failCreateGain = true // force the half-built-context cleanup path
+    FakeAudioContext.rejectClose = true // ...and make the cleanup itself reject
+
+    const rejections: unknown[] = []
+    const onUnhandled = (reason: unknown) => rejections.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const { createSynthEngine } = await loadSynth()
+      const synth = createSynthEngine()
+      expect(() => synth.resume()).not.toThrow()
+      await settle()
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+    expect(rejections, 'building.close() must .catch() its rejection, like resume() does').toEqual(
+      [],
+    )
   })
 
   it('does not leak a NEW context on every gesture after a persistent failure', async () => {

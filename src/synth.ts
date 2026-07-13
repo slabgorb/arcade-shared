@@ -135,6 +135,23 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
   }
 
   function resume(): void {
+    // RECOVERY (review round 1). A context the browser CLOSED is dead for good — every
+    // factory on it throws. The old guard was `if (ctx === null)`, and a closed context is
+    // not null, so it never rebuilt: it just nudged the corpse. A player whose tab was
+    // backgrounded (iOS reclaiming audio — the very scenario this engine exists to
+    // survive) lost sound for the REST OF THE SESSION, however many keys they pressed.
+    //
+    // resume() is wired to every gesture, so it is exactly the right place to heal. Drop
+    // the dead context and let the code below build a fresh one.
+    if (ctx !== null && ctx.state === 'closed') {
+      ctx = null
+      master = null
+      // The registry must go with it. Its voices point at nodes that no longer exist, and
+      // a stale entry would make `startVoice` a permanent no-op — the gun would never fire
+      // again. That is the trap in the obvious one-line version of this fix.
+      voices.clear()
+    }
+
     if (ctx === null) {
       const Ctor = resolveContextCtor()
       if (Ctor === null) return // no Web Audio: the game runs silent, forever
@@ -152,9 +169,15 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
         // per keystroke until the browser's cap starts rejecting new ones.
         if (building !== null) {
           try {
-            void building.close()
+            // `.catch()`, not a bare `void` (review round 1): close() returns a PROMISE, and
+            // the try/catch around it only sees a SYNCHRONOUS throw — an async rejection
+            // sails straight past into an unhandled rejection. Exactly the bug this file
+            // fixes for `ctx.resume()` a few lines below; it was left unfixed here.
+            void building.close().catch(() => {
+              /* the context is being discarded anyway */
+            })
           } catch {
-            /* nothing left to do */
+            /* close() threw synchronously — nothing left to do */
           }
         }
         ctx = null
@@ -198,6 +221,10 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
   }
 
   function isVoiceActive(name: N): boolean {
+    // A voice on a DEAD context is not running — its nodes went with the context. Saying
+    // otherwise is not just untidy, it is a lie that matters: callers use this to decide
+    // whether to (re)start a voice, so a stale `true` silences that voice permanently.
+    if (live() === null) return false
     return voices.has(name)
   }
 
