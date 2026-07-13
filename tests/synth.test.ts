@@ -517,6 +517,59 @@ describe('a closed context RECOVERS on the next gesture (review round 1)', () =>
     expect(synth.isVoiceActive('gun')).toBe(true)
   })
 
+  it('onRebuild fires so a cabinet can drop its OWN stale node references', async () => {
+    // Review round 2 caught the hole in round 1's recovery: clearing the shared registry
+    // is not enough. Each cabinet ALSO holds free-running nodes outside it — battlezone's
+    // engine hum, red-baron's hum and approach whine — kept in local `let humOsc` slots
+    // and built once behind an `if (humOsc === null)` gate.
+    //
+    // After a recovery those refs are still non-null, pointing at nodes on the DEAD
+    // context, so the build gate never re-fires and the hum is silent for the rest of the
+    // session — while gun/saucer/track come back. A HALF recovery, which is nastier than
+    // none: it looks like it works.
+    //
+    // The engine therefore has to TELL the cabinet its context changed.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const onRebuild = vi.fn()
+    synth.onRebuild(onRebuild)
+
+    synth.resume()
+    expect(onRebuild, 'fires for the first context too').toHaveBeenCalledTimes(1)
+
+    await contexts()[0].close()
+    synth.resume()
+    expect(onRebuild, 'and again for the replacement — that is the whole point').toHaveBeenCalledTimes(2)
+  })
+
+  it('onRebuild does NOT fire when an existing context is merely nudged', async () => {
+    // A repeat gesture on a live (or suspended) context is not a rebuild. Firing here
+    // would make cabinets tear down and rebuild their hum on every keypress.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const onRebuild = vi.fn()
+    synth.onRebuild(onRebuild)
+
+    synth.resume()
+    synth.resume()
+    synth.resume()
+    expect(onRebuild).toHaveBeenCalledTimes(1)
+  })
+
+  it('a throwing onRebuild listener cannot take down resume()', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    synth.onRebuild(() => {
+      throw new Error('a cabinet handler blew up')
+    })
+    const good = vi.fn()
+    synth.onRebuild(good)
+
+    expect(() => synth.resume()).not.toThrow()
+    expect(good, 'one bad listener must not starve the others').toHaveBeenCalledTimes(1)
+    expect(synth.ready()).toBe(true)
+  })
+
   it('a context closed mid-life does not resurrect itself without a gesture', async () => {
     // Recovery is gesture-driven, not spontaneous: until resume() fires, the engine stays
     // silent. (Autoplay policy — we may not build a context on our own initiative.)

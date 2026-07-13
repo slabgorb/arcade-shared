@@ -64,6 +64,21 @@ export interface SynthEngine<N extends string> {
    */
   withAudio(effect: (target: SynthTarget) => void): void
   /**
+   * Register a listener fired whenever a NEW context is built — the first one, and every
+   * replacement after a recovery. A repeat gesture on an EXISTING context is not a rebuild
+   * and does not fire it.
+   *
+   * A cabinet MUST use this to drop any node it holds OUTSIDE the voice registry: a
+   * free-running hum oscillator, an approach whine — anything built once behind an
+   * `if (node === null)` gate. Such a reference survives a recovery still pointing at the
+   * DEAD context, so the gate never re-fires and that sound stays silent for the rest of
+   * the session while the registry voices come back.
+   *
+   * That HALF recovery is worse than no recovery: it looks like it works. (Found in review
+   * round 2 — the round-1 recovery fix opened exactly this hole in both cabinets.)
+   */
+  onRebuild(listener: () => void): void
+  /**
    * Start a sustained voice under `name`, building it with `build`. Idempotent: a
    * repeat start on an already-running voice does NOT build a second one (the cabinets
    * re-trigger these every frame a control is held).
@@ -109,6 +124,9 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
   let master: GainNode | null = null
 
   const voices = new Map<N, Voice>()
+  // Cabinets register here to drop the nodes they hold outside the registry (hum, whine)
+  // whenever the context is replaced. Without this, a recovery is only HALF a recovery.
+  const rebuildListeners: Array<() => void> = []
 
   // `??`, never `||`: 0 is a perfectly valid gain (a deliberately muted cabinet) and is
   // falsy, so `||` would silently overwrite it with the default.
@@ -184,6 +202,19 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
         master = null
         return
       }
+
+      // A NEW context exists. Tell the cabinets so they can drop the nodes they hold
+      // outside the registry — their hum, their whine — which still point at the dead
+      // context and would otherwise never be rebuilt.
+      //
+      // Fired only here, inside the construction branch: a repeat gesture on an existing
+      // context is not a rebuild, and firing on every keypress would have the cabinets
+      // tearing down and re-creating their hum continuously.
+      //
+      // `guard()`ed, because these are cabinet callbacks running inside resume() — the one
+      // function this whole file exists to keep throw-proof. One bad listener must not take
+      // down the gesture handler, nor starve the listeners after it.
+      for (const listener of rebuildListeners) guard(listener)
     }
     // Repeat gestures land here: nudge a context the browser left suspended. resume()
     // REJECTS on a closed context — swallow it rather than let it surface as an
@@ -191,6 +222,10 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
     void ctx.resume().catch(() => {
       /* a closed context simply stays silent */
     })
+  }
+
+  function onRebuild(listener: () => void): void {
+    rebuildListeners.push(listener)
   }
 
   function withAudio(effect: (target: SynthTarget) => void): void {
@@ -232,5 +267,5 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
     return live() !== null
   }
 
-  return { resume, withAudio, startVoice, stopVoice, isVoiceActive, ready }
+  return { resume, withAudio, onRebuild, startVoice, stopVoice, isVoiceActive, ready }
 }
