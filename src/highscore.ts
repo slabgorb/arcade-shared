@@ -156,22 +156,41 @@ export function makeHighScoreRowGuard<DomainKey extends string>(
 // cabinet onto one origin on COST, not merit: swapping the cookie for same-origin
 // localStorage (or a fetch) must remain a one-adapter change.
 
-/**
- * How a game's top score gets across the origin boundary to the lobby.
- *
- * `publish(gameId, null)` means "this game has NO score" and must CLEAR the published
- * value — it is not the same as declining to publish. That distinction is load-bearing:
- * the cookie is derived from the table, and derivation is a total function. If the table
- * is empty, the derived value is *no score*, and a transport with no way to say so leaves
- * a stale number behind that outlives the board it came from.
- */
-export interface TopScoreTransport {
-  publish(gameId: string, score: number | null): void
-  read(gameId: string): number | null
+/** One published high-score row: the arcade initials and the score, and nothing else. The
+ *  game's own domain field (`level` | `wave`) is deliberately NOT carried across — the board
+ *  draws a name and a number, and a summary that leaked a game-private field would let the
+ *  lobby accidentally depend on it. */
+export interface TopScoreRow {
+  name: string
+  score: number
 }
 
-/** The published cookie: `arcade-hi-tempest=124500`. One per game, so no game can
- *  clobber a sibling's score via a read-modify-write on a shared cookie. */
+/** How many rows the published summary carries — the design's TOP FIVE ladder. The single
+ *  source of truth for the cap; the factory derives at most this many, highest first, and the
+ *  read caps at it too so a bloated hostile cookie cannot grow the board's ladder. */
+export const PUBLISHED_SUMMARY_DEPTH = 5
+
+/**
+ * How a game's published high-score SUMMARY gets across the origin boundary to the lobby.
+ *
+ * lb2-8 widened this from a single number to the board's ladder: `publish` carries the top-N
+ * name+score ROWS (already derived, sorted highest-first and capped at PUBLISHED_SUMMARY_DEPTH),
+ * and `read` hands them back. The tile's single top score is still available — it is row 0's
+ * score (see `readTopScore`), which also still parses a legacy bare-number cookie.
+ *
+ * `publish(gameId, [])` means "this game has NO score" and must CLEAR the published value — it
+ * is not the same as declining to publish. That distinction is load-bearing: the summary is
+ * derived from the table, and derivation is a total function. If the table is empty, the derived
+ * summary is *no rows*, and a transport with no way to say so leaves a stale ladder behind that
+ * outlives the board it came from.
+ */
+export interface TopScoreTransport {
+  publish(gameId: string, rows: readonly TopScoreRow[]): void
+  read(gameId: string): TopScoreRow[]
+}
+
+/** The published cookie: `arcade-hi-tempest=JPX:149830,AAA:98000`. One per game, so no game
+ *  can clobber a sibling's ladder via a read-modify-write on a shared cookie. */
 function topScoreCookieName(gameId: string): string {
   return `arcade-hi-${gameId}`
 }
@@ -205,6 +224,64 @@ function parseTopScore(value: string): number | null {
   if (!/^\d+$/.test(value)) return null
   const score = Number(value)
   return isPublishableScore(score) ? score : null
+}
+
+// --- rows summary encoding (lb2-8) -------------------------------------------
+//
+// The widened summary is a list of `name:score` pairs joined by commas:
+// `JPX:149830,AAA:98000`. NAMES are the new untrusted input the widening introduces
+// (gameId is already slug-guarded); a name lands in the cookie value where ; = , : are
+// structural, so it is sanitized on the way in and re-validated on the way back.
+
+// Strip the cookie/encoding delimiters (`; = , :`) AND any control/newline characters (the C0
+// range plus DEL) from a name, so a hostile `X;Y=Z,Q:R` — or one carrying a newline — cannot
+// forge a cookie attribute, a second cookie, or an extra ladder row. Arcade initials never
+// contain any of these, so a real name is untouched.
+function sanitizeName(name: string): string {
+  return name.replace(/[;=,:\u0000-\u001f\u007f]/g, '')
+}
+
+// Encode rows as `name:score,name:score`, sanitizing each name and dropping any row that
+// cannot be safely represented (a non-string name, a non-publishable score, or a name that is
+// nothing but delimiters and sanitizes to empty). Returns null when nothing publishable
+// remains — which builds the CLEAR form of the cookie, so an empty ladder never leaves a
+// zombie behind.
+function encodeRows(rows: readonly TopScoreRow[]): string | null {
+  const parts: string[] = []
+  for (const row of rows) {
+    if (typeof row.name !== 'string' || !isPublishableScore(row.score)) continue
+    const name = sanitizeName(row.name)
+    if (name === '') continue
+    parts.push(`${name}:${row.score}`)
+  }
+  return parts.length > 0 ? parts.join(',') : null
+}
+
+// Decode the cookie value back into rows, dropping anything that is not a clean `name:score`
+// pair. The value is UNTRUSTED (any subdomain can write it, a player can edit it, ITP can
+// shred it), so a junk pair becomes NO row, never a confident wrong one — and a LEGACY
+// bare-number value (`124500`, published before this story) carries no `:`, so it yields no
+// rows and the board shows its empty state until the game republishes.
+//
+// SORT highest-first on the way back, then cap at PUBLISHED_SUMMARY_DEPTH — mirroring the
+// write side (`topRowsOf`). The cookie WE write is already sorted, but an untrusted value may
+// be out of order, and both `readTopScores`' "highest first" contract and `readTopScore`'s
+// "row 0 is the max" assumption must hold against a hostile/hand-edited cookie, not just our
+// own. Sorting before the slice also means the top-N are the true top-N by score, not the
+// first N encountered. The cookie is browser-capped at 4096 B, so the row count is bounded.
+function decodeRows(value: string): TopScoreRow[] {
+  const rows: TopScoreRow[] = []
+  for (const pair of value.split(',')) {
+    const colon = pair.indexOf(':')
+    if (colon === -1) continue
+    const name = pair.slice(0, colon)
+    if (name === '') continue
+    const score = parseTopScore(pair.slice(colon + 1))
+    if (score === null) continue
+    rows.push({ name, score })
+  }
+  rows.sort((a, b) => b.score - a.score)
+  return rows.slice(0, PUBLISHED_SUMMARY_DEPTH)
 }
 
 // The DOM may be absent (node, SSR) or hostile (sandboxed iframes and private mode can
@@ -249,15 +326,15 @@ function registrableDomain(hostname: string): string | null {
   return labels.slice(-2).join('.')
 }
 
-// `score: null` builds the DELETION form of the same cookie. A browser only removes a
+// `value: null` builds the DELETION form of the same cookie. A browser only removes a
 // cookie when the expiring write carries the SAME Domain and Path as the original, so the
 // two forms must be built from one place — a clear that quietly misses on Domain would
-// leave the stale score sitting there while appearing to work.
-function buildTopScoreCookie(name: string, score: number | null, page: Location | null): string {
+// leave the stale ladder sitting there while appearing to work.
+function buildTopScoreCookie(name: string, value: string | null, page: Location | null): string {
   const parts =
-    score === null
+    value === null
       ? [`${name}=`, 'Path=/', 'SameSite=Lax', 'Max-Age=0']
-      : [`${name}=${score}`, 'Path=/', 'SameSite=Lax', `Max-Age=${TOP_SCORE_MAX_AGE_SECONDS}`]
+      : [`${name}=${value}`, 'Path=/', 'SameSite=Lax', `Max-Age=${TOP_SCORE_MAX_AGE_SECONDS}`]
 
   const domain = page ? registrableDomain(page.hostname) : null
   if (domain) parts.push(`Domain=${domain}`)
@@ -268,56 +345,76 @@ function buildTopScoreCookie(name: string, score: number | null, page: Location 
   return parts.join('; ')
 }
 
-/** The default transport: one cookie per game on the shared parent domain. */
+// Read the raw summary cookie VALUE for a game, or null (no cookie / no DOM / hostile doc).
+// Both `readTopScores` (rows) and `readTopScore` (the top number, incl. the legacy fallback)
+// go through here, so the jar parsing and exact-name matching live in exactly one place.
+function readSummaryCookie(gameId: string): string | null {
+  if (!isValidGameId(gameId)) return null
+
+  const doc = getDocument()
+  if (!doc) return null
+
+  let jar: string
+  try {
+    jar = doc.cookie
+  } catch {
+    return null
+  }
+  if (typeof jar !== 'string' || jar === '') return null
+
+  // Match the cookie NAME exactly. A substring test would let `arcade-hi-star-wars`
+  // answer a lookup for `star`, and a lookalike cookie impersonate a real one.
+  const wanted = topScoreCookieName(gameId)
+  for (const pair of jar.split(';')) {
+    const eq = pair.indexOf('=')
+    if (eq === -1) continue
+    if (pair.slice(0, eq).trim() !== wanted) continue
+    return pair.slice(eq + 1).trim()
+  }
+  return null
+}
+
+/** The default transport: one cookie per game on the shared parent domain, carrying the
+ *  top-N ladder as `name:score` pairs. */
 export const cookieTopScoreTransport: TopScoreTransport = {
-  publish(gameId: string, score: number | null): void {
+  publish(gameId: string, rows: readonly TopScoreRow[]): void {
     if (!isValidGameId(gameId)) return
-    // A bogus score (0, negative, NaN, Infinity, fractional) is a caller error, not an
-    // assertion that the game has no score — decline it without touching the cookie.
-    // Only an explicit `null` means "no score", and that CLEARS.
-    if (score !== null && !isPublishableScore(score)) return
 
     const doc = getDocument()
     if (!doc) return
 
     try {
-      doc.cookie = buildTopScoreCookie(topScoreCookieName(gameId), score, getLocation())
+      // `encodeRows` returns null for an empty/all-unpublishable ladder, which builds the
+      // CLEAR form — so an empty board can never leave a stale ladder behind.
+      doc.cookie = buildTopScoreCookie(topScoreCookieName(gameId), encodeRows(rows), getLocation())
     } catch {
-      // A failed publish costs a cached number, not a score. Never take the page down.
+      // A failed publish costs a cached ladder, not a score. Never take the page down.
     }
   },
 
-  read(gameId: string): number | null {
-    if (!isValidGameId(gameId)) return null
-
-    const doc = getDocument()
-    if (!doc) return null
-
-    let jar: string
-    try {
-      jar = doc.cookie
-    } catch {
-      return null
-    }
-    if (typeof jar !== 'string' || jar === '') return null
-
-    // Match the cookie NAME exactly. A substring test would let `arcade-hi-star-wars`
-    // answer a lookup for `star`, and a lookalike cookie impersonate a real one.
-    const wanted = topScoreCookieName(gameId)
-    for (const pair of jar.split(';')) {
-      const eq = pair.indexOf('=')
-      if (eq === -1) continue
-      if (pair.slice(0, eq).trim() !== wanted) continue
-      return parseTopScore(pair.slice(eq + 1).trim())
-    }
-    return null
+  read(gameId: string): TopScoreRow[] {
+    const raw = readSummaryCookie(gameId)
+    return raw === null ? [] : decodeRows(raw)
   },
 }
 
-/** The single best score a game has published, or null when there is none to show.
- *  This is what the LOBBY imports — its only contract with the games (ADR-0004). */
-export function readTopScore(gameId: string): number | null {
+/** The board's published ladder for a game — up to PUBLISHED_SUMMARY_DEPTH name+score rows,
+ *  highest first, or [] when there is nothing trustworthy to show (never a fabricated row).
+ *  This is what the LOBBY's high-scores board imports (lb2-8, widening ADR-0004). */
+export function readTopScores(gameId: string): TopScoreRow[] {
   return cookieTopScoreTransport.read(gameId)
+}
+
+/** The single best score a game has published, or null when there is none to show. Derives
+ *  from row 0 of the widened summary, and still parses a LEGACY bare-number cookie so a tile
+ *  does not blank mid-rollout (before a game is redeployed on this version). This is what the
+ *  lobby's TILE imports — its original ADR-0004 contract, unbroken by the widening. */
+export function readTopScore(gameId: string): number | null {
+  const raw = readSummaryCookie(gameId)
+  if (raw === null) return null
+  const rows = decodeRows(raw)
+  if (rows.length > 0) return rows[0].score
+  return parseTopScore(raw)
 }
 
 // --- the persistence factory -------------------------------------------------
@@ -351,39 +448,43 @@ export function makeHighScoreStorage<E extends HighScoreEntryBase>(
 ): HighScoreStorage<E> {
   const key = highScoreKey(gameId)
 
-  // The board's best score, or null when there is nothing worth publishing. Takes the
-  // MAX rather than trusting table[0]: the table is written sorted, but corrupt or
-  // unsorted data must still yield the true top score instead of a lower wrong one.
-  function topScoreOf(table: readonly E[]): number | null {
-    let top: number | null = null
+  // The board's top-N ladder, or [] when there is nothing worth publishing. Derives the
+  // summary the transport carries: keep only rows with a string name and a publishable
+  // (finite, positive, whole) score — the same finite line isHighScoreRow holds — carry
+  // name+score ONLY (the game-private `level`/`wave` field does not ride across), sort
+  // highest-first (the table is written sorted, but corrupt or unsorted data must still
+  // yield the true ranking), and cap at PUBLISHED_SUMMARY_DEPTH.
+  function topRowsOf(table: readonly E[]): TopScoreRow[] {
+    const rows: TopScoreRow[] = []
     for (const entry of table) {
-      if (!Number.isFinite(entry.score)) continue
-      if (top === null || entry.score > top) top = entry.score
+      if (typeof entry.name !== 'string' || !isPublishableScore(entry.score)) continue
+      rows.push({ name: entry.name, score: entry.score })
     }
-    return top !== null && isPublishableScore(top) ? top : null
+    rows.sort((a, b) => b.score - a.score)
+    return rows.slice(0, PUBLISHED_SUMMARY_DEPTH)
   }
 
-  // Publish the derived top score across the origin boundary so the lobby can read it.
-  // This is the choke point ADR-0004 targets: every game already calls this factory
-  // exactly once, so installing the publish HERE fixes tempest / star-wars / asteroids /
-  // battlezone with a version bump and no game-side code at all.
+  // Publish the derived ladder across the origin boundary so the lobby's board can read it.
+  // This is the choke point ADR-0004 targets: every game already calls this factory exactly
+  // once, so installing the publish HERE reaches tempest / star-wars / asteroids / battlezone
+  // with a version bump and no game-side code at all.
   //
-  // The cookie MIRRORS the table in BOTH directions. An empty board publishes `null`,
-  // which CLEARS the cookie — it does not merely decline to write. Skipping the clear is
-  // what let a stale score outlive the table it came from: the player's board was gone
-  // (quota eviction, an ITP purge, a cleared localStorage) while the cookie kept
-  // advertising a high score for up to 400 days, and replaying the game could not fix it,
-  // because a load with an empty table published nothing. That is a tile showing a number
-  // the game itself denies — the exact defect this story exists to remove. ADR-0004 says
-  // the cookie is "fully derivable from the table"; derivation is a TOTAL function, and
-  // the derived value of an empty table is NO SCORE.
+  // The cookie MIRRORS the table in BOTH directions. An empty board derives NO rows, and the
+  // transport CLEARS on `[]` — it does not merely decline to write. Skipping the clear is what
+  // let a stale ladder outlive the table it came from: the player's board was gone (quota
+  // eviction, an ITP purge, a cleared localStorage) while the cookie kept advertising a high
+  // score for up to 400 days, and replaying the game could not fix it, because a load with an
+  // empty table published nothing. That is a tile showing a number the game itself denies — the
+  // exact defect this story exists to remove. ADR-0004 says the cookie is "fully derivable from
+  // the table"; derivation is a TOTAL function, and the derived summary of an empty table is
+  // NO ROWS.
   function publishTop(table: readonly E[]): void {
     try {
-      transport.publish(gameId, topScoreOf(table))
+      transport.publish(gameId, topRowsOf(table))
     } catch {
       // The cookie is a cache; the player's scores are not. A transport that blows up
       // must never cost a score or crash a game.
-      console.warn(`[highscore] could not publish ${gameId}'s top score; the lobby may lag`)
+      console.warn(`[highscore] could not publish ${gameId}'s high-score summary; the lobby may lag`)
     }
   }
 

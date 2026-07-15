@@ -33,7 +33,8 @@ import {
   makeHighScoreStorage,
   makeHighScoreRowGuard,
   highScoreKey,
-  cookieTopScoreTransport,
+  readTopScore,
+  type TopScoreRow,
 } from '../src/highscore'
 
 const guard = makeHighScoreRowGuard('level')
@@ -52,17 +53,17 @@ function installBrowser(jar: CookieJar, storage: Storage): void {
   vi.stubGlobal('localStorage', storage)
 }
 
-/** A transport that records what it was asked to publish, and can be told to fail. */
+/** A transport that records the ROWS it was asked to publish, and can be told to fail. */
 function spyTransport(opts: { throws?: boolean } = {}) {
-  const published: Array<{ gameId: string; score: number }> = []
+  const published: Array<{ gameId: string; rows: TopScoreRow[] }> = []
   return {
     published,
-    publish(gameId: string, score: number): void {
-      published.push({ gameId, score })
+    publish(gameId: string, rows: readonly TopScoreRow[]): void {
+      published.push({ gameId, rows: [...rows] })
       if (opts.throws) throw new Error('cookie jar is on fire')
     },
-    read(): number | null {
-      return null
+    read(): TopScoreRow[] {
+      return []
     },
   }
 }
@@ -86,7 +87,9 @@ describe('the four shipped games are fixed by a version bump alone', () => {
     const storage = makeHighScoreStorage('tempest', guard)
     storage.save(table(9000, 3000))
 
-    expect(jar.values()[COOKIE]).toBe('9000')
+    // The tile's top score derives from the published summary (row 0) — a value here proves
+    // the publish ran from the SAME two-argument call, whatever the summary's encoding.
+    expect(readTopScore('tempest')).toBe(9000)
   })
 })
 
@@ -101,7 +104,7 @@ describe('save() — publishes the top score', () => {
 
     makeHighScoreStorage('tempest', guard).save(table(124500, 90000, 100))
 
-    expect(jar.values()[COOKIE]).toBe('124500')
+    expect(readTopScore('tempest')).toBe(124500)
   })
 
   it('publishes the MAX, not the first row — corrupt or unsorted data must not lie', () => {
@@ -113,7 +116,7 @@ describe('save() — publishes the top score', () => {
 
     makeHighScoreStorage('tempest', guard).save(table(100, 124500, 3000))
 
-    expect(jar.values()[COOKIE]).toBe('124500')
+    expect(readTopScore('tempest')).toBe(124500)
   })
 
   it('publishes nothing for an empty board — NO SCORE, not a score of 0', () => {
@@ -165,7 +168,7 @@ describe('the table remains the source of truth', () => {
     const loaded = makeHighScoreStorage('tempest', guard).load()
 
     expect(loaded).toEqual(table(124500, 900))
-    expect(jar.values()[COOKIE], 'load() must republish from the table').toBe('124500')
+    expect(readTopScore('tempest'), 'load() must republish from the table').toBe(124500)
   })
 })
 
@@ -183,7 +186,7 @@ describe('load() — republishes on every game load (self-heal)', () => {
 
     makeHighScoreStorage('tempest', guard).load()
 
-    expect(jar.values()[COOKIE]).toBe('124500')
+    expect(readTopScore('tempest')).toBe(124500)
   })
 
   it('publishes nothing when the game has no stored table yet (a fresh player)', () => {
@@ -208,7 +211,7 @@ describe('load() — republishes on every game load (self-heal)', () => {
 
     makeHighScoreStorage('tempest', guard).load()
 
-    expect(jar.values()[COOKIE]).toBe('4200')
+    expect(readTopScore('tempest')).toBe(4200)
   })
 })
 
@@ -292,11 +295,11 @@ describe('load() — a table that is gone CLEARS the cookie, it does not leave a
   it('round-trips: a cleared cookie reads back as NO SCORE, never as a stale number', () => {
     const jar = makeCookieJar({ [COOKIE]: '50000' })
     installBrowser(jar, makeFakeStorage())
-    expect(cookieTopScoreTransport.read('tempest'), 'precondition: the zombie is there').toBe(50000)
+    expect(readTopScore('tempest'), 'precondition: the zombie is there').toBe(50000)
 
     makeHighScoreStorage('tempest', guard).load()
 
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(readTopScore('tempest')).toBeNull()
   })
 })
 
@@ -365,7 +368,9 @@ describe('the transport is injectable — single-origin stays one adapter swap a
 
     makeHighScoreStorage('tempest', guard, transport).save(table(9000, 100))
 
-    expect(transport.published).toEqual([{ gameId: 'tempest', score: 9000 }])
+    expect(transport.published).toEqual([
+      { gameId: 'tempest', rows: [{ name: 'AAA', score: 9000 }, { name: 'AAA', score: 100 }] },
+    ])
     expect(jar.values()[COOKIE], 'the cookie transport must NOT also have run').toBeUndefined()
   })
 
@@ -375,6 +380,6 @@ describe('the transport is injectable — single-origin stays one adapter swap a
 
     makeHighScoreStorage('tempest', guard, transport).load()
 
-    expect(transport.published).toEqual([{ gameId: 'tempest', score: 4200 }])
+    expect(transport.published).toEqual([{ gameId: 'tempest', rows: [{ name: 'AAA', score: 4200 }] }])
   })
 })
