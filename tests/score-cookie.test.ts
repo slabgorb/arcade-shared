@@ -37,11 +37,19 @@ import {
   DEV_LOCALHOST,
   type CookieJar,
 } from './helpers/cookie-jar'
-import { cookieTopScoreTransport, readTopScore } from '../src/highscore'
+import { cookieTopScoreTransport, readTopScore, type TopScoreRow } from '../src/highscore'
 
 afterEach(() => {
   vi.unstubAllGlobals()
 })
+
+// lb2-8 widened the transport from a single number to the board's ladder: `publish` now
+// takes name+score ROWS and `read` returns them. This suite predates that and cares about the
+// cookie MECHANICS — cross-origin scope, injection-safety, clear, fail-soft — which are the
+// same whether the value is one number or five rows. So each scalar publish is wrapped in a
+// one-row ladder, and each number/null-facing read goes through `readTopScore` (row 0's score,
+// with the legacy bare-number fallback), keeping every mechanics assertion below meaningful.
+const ladder = (score: number): TopScoreRow[] => [{ name: 'AAA', score }]
 
 /** Put a cookie jar and a page location on the global, as a browser would. */
 function installBrowser(
@@ -71,13 +79,13 @@ const FOUR_HUNDRED_DAYS = 400 * 24 * 60 * 60
 // ---------------------------------------------------------------------------
 
 describe('publish — the cookie shape in PRODUCTION (six subdomains)', () => {
-  it('writes `arcade-hi-<gameId>=<score>` so the lobby can find it by name', () => {
+  it('writes `arcade-hi-<gameId>=<name:score,…>` so the lobby can find it by name', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 124500)
+    cookieTopScoreTransport.publish('tempest', ladder(124500))
 
-    expect(jar.values()['arcade-hi-tempest']).toBe('124500')
+    expect(jar.values()['arcade-hi-tempest']).toBe('AAA:124500')
   })
 
   it('scopes the cookie to the REGISTRABLE DOMAIN — without this the fix does nothing', () => {
@@ -88,7 +96,7 @@ describe('publish — the cookie shape in PRODUCTION (six subdomains)', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     const [write] = jar.writes
     expect(write, 'publish must assign to document.cookie').toBeDefined()
@@ -99,7 +107,7 @@ describe('publish — the cookie shape in PRODUCTION (six subdomains)', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     const { raw } = jar.writes[0]
     expect(attr(raw, 'path')).toBe('/')
@@ -111,7 +119,7 @@ describe('publish — the cookie shape in PRODUCTION (six subdomains)', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     const maxAge = Number(attr(jar.writes[0].raw, 'max-age'))
     expect(Number.isFinite(maxAge), 'a Max-Age must be set, or the cookie dies with the session')
@@ -130,7 +138,7 @@ describe('publish — the cookie shape in DEV (`just serve`, six localhost ports
     const jar = makeCookieJar()
     installBrowser(jar, DEV_LOCALHOST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     const { raw } = jar.writes[0]
     expect(hasDomain(raw), `expected NO Domain on localhost, got: ${attributesOf(raw)}`).toBe(false)
@@ -140,7 +148,7 @@ describe('publish — the cookie shape in DEV (`just serve`, six localhost ports
     const jar = makeCookieJar()
     installBrowser(jar, DEV_LOCALHOST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     const { raw } = jar.writes[0]
     expect(hasSecure(raw), `expected no Secure over http, got: ${attributesOf(raw)}`).toBe(false)
@@ -150,9 +158,9 @@ describe('publish — the cookie shape in DEV (`just serve`, six localhost ports
     const jar = makeCookieJar()
     installBrowser(jar, DEV_LOCALHOST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
-    expect(cookieTopScoreTransport.read('tempest')).toBe(9000)
+    expect(readTopScore('tempest')).toBe(9000)
   })
 })
 
@@ -171,12 +179,12 @@ describe('publish — one cookie per game', () => {
     })
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     expect(jar.values()).toEqual({
       'arcade-hi-star-wars': '8000',
       'arcade-hi-asteroids': '4400',
-      'arcade-hi-tempest': '9000',
+      'arcade-hi-tempest': 'AAA:9000',
     })
   })
 
@@ -184,42 +192,49 @@ describe('publish — one cookie per game', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', 9000)
+    cookieTopScoreTransport.publish('tempest', ladder(9000))
 
     expect(jar.writes).toHaveLength(1)
     expect(jar.writes[0].name).toBe('arcade-hi-tempest')
   })
 
-  it('refuses to publish a non-score (0, negative, NaN, Infinity) rather than write a lie', () => {
+  it('drops a row whose score is a non-score (0, negative, NaN, Infinity, fractional)', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
     for (const bogus of [0, -1, -9000, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
-      cookieTopScoreTransport.publish('tempest', bogus)
+      cookieTopScoreTransport.publish('tempest', ladder(bogus))
     }
 
-    // No score is an honest NO SCORE; a published `0` would render as a real score of 0.
+    // An all-unpublishable ladder encodes to nothing and clears — a published `0` would
+    // otherwise render as a real score of 0. No score is an honest NO SCORE.
     expect(jar.values()['arcade-hi-tempest']).toBeUndefined()
   })
 })
 
 // ---------------------------------------------------------------------------
-// publish(gameId, null) — the transport can say "this game has NO score"
+// publish(gameId, []) — the transport can say "this game has NO score"
 // ---------------------------------------------------------------------------
 //
-// A transport that can only ever WRITE a number cannot express absence, and absence then
-// becomes silence — leaving a stale cookie behind that outlives the table it was derived
-// from. `null` is how the caller says "the board is empty"; it must CLEAR.
+// A transport that can only ever WRITE rows cannot express absence, and absence then becomes
+// silence — leaving a stale ladder behind that outlives the table it was derived from. An
+// empty ladder is how the caller says "the board is empty"; it must CLEAR.
+//
+// (lb2-8 note: the old suite also drew a "bogus number is a caller error, decline it — do NOT
+// clear" distinction. That lived at the number transport; the rows transport is fed only
+// pre-filtered rows by the factory, so an all-unpublishable ladder is indistinguishable from an
+// empty one and both clear. The dropped-row guarantee now lives at the factory boundary —
+// highscore-summary.test.ts "drops poisoned rows".)
 
-describe('publish(null) — clears the published score', () => {
+describe('publish([]) — clears the published summary', () => {
   it('removes an existing cookie', () => {
     const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', null)
+    cookieTopScoreTransport.publish('tempest', [])
 
     expect(jar.values()['arcade-hi-tempest']).toBeUndefined()
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(readTopScore('tempest')).toBeNull()
   })
 
   it('expires the cookie on the SAME Domain and Path it was set with', () => {
@@ -229,7 +244,7 @@ describe('publish(null) — clears the published score', () => {
     const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', null)
+    cookieTopScoreTransport.publish('tempest', [])
 
     const { raw } = jar.writes[0]
     expect(attr(raw, 'domain')).toBe('slabgorb.com')
@@ -241,7 +256,7 @@ describe('publish(null) — clears the published score', () => {
     const jar = makeCookieJar({ 'arcade-hi-tempest': '50000', 'arcade-hi-star-wars': '8000' })
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('tempest', null)
+    cookieTopScoreTransport.publish('tempest', [])
 
     expect(jar.values()).toEqual({ 'arcade-hi-star-wars': '8000' })
   })
@@ -250,22 +265,8 @@ describe('publish(null) — clears the published score', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    expect(() => cookieTopScoreTransport.publish('tempest', null)).not.toThrow()
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
-  })
-
-  it('a bogus score is NOT treated as "no score" — it leaves the cookie untouched', () => {
-    // The distinction that matters: `null` is a claim about the board ("it is empty").
-    // `0` / `NaN` / `-1` are caller errors. An error must not be allowed to wipe a good
-    // published score.
-    const jar = makeCookieJar({ 'arcade-hi-tempest': '50000' })
-    installBrowser(jar, PROD_TEMPEST)
-
-    for (const bogus of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 1.5]) {
-      cookieTopScoreTransport.publish('tempest', bogus)
-    }
-
-    expect(jar.values()['arcade-hi-tempest']).toBe('50000')
+    expect(() => cookieTopScoreTransport.publish('tempest', [])).not.toThrow()
+    expect(readTopScore('tempest')).toBeNull()
   })
 })
 
@@ -281,7 +282,7 @@ describe('a hostile gameId cannot inject cookie attributes', () => {
     const jar = makeCookieJar()
     installBrowser(jar, PROD_TEMPEST)
 
-    cookieTopScoreTransport.publish('x; Domain=evil.example', 9000)
+    cookieTopScoreTransport.publish('x; Domain=evil.example', ladder(9000))
 
     expect(jar.writes, 'nothing may be written at all').toHaveLength(0)
     expect(jar.values()).toEqual({})
@@ -292,8 +293,8 @@ describe('a hostile gameId cannot inject cookie attributes', () => {
     installBrowser(jar, PROD_TEMPEST)
 
     for (const hostile of ['a=b', 'has space', '', 'UPPER', 'semi;colon']) {
-      cookieTopScoreTransport.publish(hostile, 9000)
-      expect(cookieTopScoreTransport.read(hostile), `read(${JSON.stringify(hostile)})`).toBeNull()
+      cookieTopScoreTransport.publish(hostile, ladder(9000))
+      expect(readTopScore(hostile), `read(${JSON.stringify(hostile)})`).toBeNull()
     }
 
     expect(jar.values(), 'the real cookie is untouched').toEqual({ 'arcade-hi-tempest': '9000' })
@@ -305,8 +306,8 @@ describe('a hostile gameId cannot inject cookie attributes', () => {
     installBrowser(jar, PROD_TEMPEST)
 
     for (const id of ['tempest', 'star-wars', 'asteroids', 'battlezone', 'red-baron']) {
-      cookieTopScoreTransport.publish(id, 1234)
-      expect(cookieTopScoreTransport.read(id), id).toBe(1234)
+      cookieTopScoreTransport.publish(id, ladder(1234))
+      expect(readTopScore(id), id).toBe(1234)
     }
   })
 })
@@ -322,7 +323,7 @@ describe('read — picks the right cookie out of a shared jar', () => {
     const jar = makeCookieJar({ 'arcade-hi-tempest': '124500' })
     installBrowser(jar, { hostname: 'arcade.slabgorb.com', protocol: 'https:' })
 
-    expect(cookieTopScoreTransport.read('tempest')).toBe(124500)
+    expect(readTopScore('tempest')).toBe(124500)
   })
 
   it('finds its cookie among unrelated cookies', () => {
@@ -333,7 +334,7 @@ describe('read — picks the right cookie out of a shared jar', () => {
     })
     installBrowser(jar)
 
-    expect(cookieTopScoreTransport.read('tempest')).toBe(9000)
+    expect(readTopScore('tempest')).toBe(9000)
   })
 
   it('keeps each game separate', () => {
@@ -343,8 +344,8 @@ describe('read — picks the right cookie out of a shared jar', () => {
     })
     installBrowser(jar)
 
-    expect(cookieTopScoreTransport.read('tempest')).toBe(5000)
-    expect(cookieTopScoreTransport.read('star-wars')).toBe(8000)
+    expect(readTopScore('tempest')).toBe(5000)
+    expect(readTopScore('star-wars')).toBe(8000)
   })
 
   it('does not match a cookie whose name merely CONTAINS the game id', () => {
@@ -358,20 +359,20 @@ describe('read — picks the right cookie out of a shared jar', () => {
     })
     installBrowser(jar)
 
-    expect(cookieTopScoreTransport.read('star')).toBeNull()
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(readTopScore('star')).toBeNull()
+    expect(readTopScore('tempest')).toBeNull()
   })
 
   it('returns null when the game has never published', () => {
     installBrowser(makeCookieJar({ 'arcade-hi-tempest': '9000' }))
 
-    expect(cookieTopScoreTransport.read('red-baron')).toBeNull()
+    expect(readTopScore('red-baron')).toBeNull()
   })
 
   it('returns null for an empty jar', () => {
     installBrowser(makeCookieJar())
 
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(readTopScore('tempest')).toBeNull()
   })
 })
 
@@ -403,8 +404,8 @@ describe('read — hostile values degrade to NO SCORE and never throw', () => {
     it(`returns null for ${label}`, () => {
       installBrowser(makeCookieJar({ 'arcade-hi-tempest': value }))
 
-      expect(() => cookieTopScoreTransport.read('tempest')).not.toThrow()
-      expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+      expect(() => readTopScore('tempest')).not.toThrow()
+      expect(readTopScore('tempest')).toBeNull()
     })
   }
 
@@ -412,7 +413,7 @@ describe('read — hostile values degrade to NO SCORE and never throw', () => {
     // The guard must reject junk without also rejecting a real arcade score.
     installBrowser(makeCookieJar({ 'arcade-hi-tempest': '9999990' }))
 
-    expect(cookieTopScoreTransport.read('tempest')).toBe(9999990)
+    expect(readTopScore('tempest')).toBe(9999990)
   })
 })
 
@@ -424,29 +425,29 @@ describe('fail-soft — no document, no cookie access, no crash', () => {
   it('reads null when there is no document at all (node / SSR)', () => {
     vi.stubGlobal('document', undefined)
 
-    expect(() => cookieTopScoreTransport.read('tempest')).not.toThrow()
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(() => readTopScore('tempest')).not.toThrow()
+    expect(readTopScore('tempest')).toBeNull()
   })
 
   it('publishes as a silent no-op when there is no document', () => {
     vi.stubGlobal('document', undefined)
 
-    expect(() => cookieTopScoreTransport.publish('tempest', 9000)).not.toThrow()
+    expect(() => cookieTopScoreTransport.publish('tempest', ladder(9000))).not.toThrow()
   })
 
   it('reads null when `document.cookie` itself throws (sandboxed / private mode)', () => {
     vi.stubGlobal('document', makeHostileDocument())
     vi.stubGlobal('location', PROD_TEMPEST)
 
-    expect(() => cookieTopScoreTransport.read('tempest')).not.toThrow()
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(() => readTopScore('tempest')).not.toThrow()
+    expect(readTopScore('tempest')).toBeNull()
   })
 
   it('swallows a throwing cookie SETTER — a game must never crash on a failed publish', () => {
     vi.stubGlobal('document', makeHostileDocument())
     vi.stubGlobal('location', PROD_TEMPEST)
 
-    expect(() => cookieTopScoreTransport.publish('tempest', 9000)).not.toThrow()
+    expect(() => cookieTopScoreTransport.publish('tempest', ladder(9000))).not.toThrow()
   })
 
   it('survives an evicted cookie — ITP purges it and the tile honestly says NO SCORE', () => {
@@ -454,11 +455,11 @@ describe('fail-soft — no document, no cookie access, no crash', () => {
     // The contract is that this degrades to NO SCORE, never to a wrong number.
     const jar = makeCookieJar({ 'arcade-hi-tempest': '9000' })
     installBrowser(jar)
-    expect(cookieTopScoreTransport.read('tempest')).toBe(9000)
+    expect(readTopScore('tempest')).toBe(9000)
 
     jar.document.cookie = 'arcade-hi-tempest=; Max-Age=0'
 
-    expect(cookieTopScoreTransport.read('tempest')).toBeNull()
+    expect(readTopScore('tempest')).toBeNull()
   })
 })
 
