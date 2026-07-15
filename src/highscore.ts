@@ -233,11 +233,12 @@ function parseTopScore(value: string): number | null {
 // (gameId is already slug-guarded); a name lands in the cookie value where ; = , : are
 // structural, so it is sanitized on the way in and re-validated on the way back.
 
-// Strip the cookie/encoding delimiters from a name so a hostile `X;Y=Z,Q:R` cannot forge a
-// cookie attribute, a second cookie, or an extra ladder row. Arcade initials never contain
-// these, so a real name is untouched.
+// Strip the cookie/encoding delimiters (`; = , :`) AND any control/newline characters (the C0
+// range plus DEL) from a name, so a hostile `X;Y=Z,Q:R` — or one carrying a newline — cannot
+// forge a cookie attribute, a second cookie, or an extra ladder row. Arcade initials never
+// contain any of these, so a real name is untouched.
 function sanitizeName(name: string): string {
-  return name.replace(/[;=,:]/g, '')
+  return name.replace(/[;=,:\u0000-\u001f\u007f]/g, '')
 }
 
 // Encode rows as `name:score,name:score`, sanitizing each name and dropping any row that
@@ -260,8 +261,14 @@ function encodeRows(rows: readonly TopScoreRow[]): string | null {
 // pair. The value is UNTRUSTED (any subdomain can write it, a player can edit it, ITP can
 // shred it), so a junk pair becomes NO row, never a confident wrong one — and a LEGACY
 // bare-number value (`124500`, published before this story) carries no `:`, so it yields no
-// rows and the board shows its empty state until the game republishes. Capped at
-// PUBLISHED_SUMMARY_DEPTH so a bloated hostile cookie cannot grow the ladder.
+// rows and the board shows its empty state until the game republishes.
+//
+// SORT highest-first on the way back, then cap at PUBLISHED_SUMMARY_DEPTH — mirroring the
+// write side (`topRowsOf`). The cookie WE write is already sorted, but an untrusted value may
+// be out of order, and both `readTopScores`' "highest first" contract and `readTopScore`'s
+// "row 0 is the max" assumption must hold against a hostile/hand-edited cookie, not just our
+// own. Sorting before the slice also means the top-N are the true top-N by score, not the
+// first N encountered. The cookie is browser-capped at 4096 B, so the row count is bounded.
 function decodeRows(value: string): TopScoreRow[] {
   const rows: TopScoreRow[] = []
   for (const pair of value.split(',')) {
@@ -272,9 +279,9 @@ function decodeRows(value: string): TopScoreRow[] {
     const score = parseTopScore(pair.slice(colon + 1))
     if (score === null) continue
     rows.push({ name, score })
-    if (rows.length === PUBLISHED_SUMMARY_DEPTH) break
   }
-  return rows
+  rows.sort((a, b) => b.score - a.score)
+  return rows.slice(0, PUBLISHED_SUMMARY_DEPTH)
 }
 
 // The DOM may be absent (node, SSR) or hostile (sandboxed iframes and private mode can

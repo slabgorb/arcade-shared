@@ -99,6 +99,21 @@ describe('save() publishes a rows summary the board can read back', () => {
     ])
   })
 
+  it('re-sorts an out-of-order (hand-edited/hostile) cookie highest-first on READ', () => {
+    // Our own writes are always sorted, but the cookie is UNTRUSTED — any subdomain can write it
+    // and a player can hand-edit it. The read path must still honour the documented "highest
+    // first" contract, or the board renders a lower score above a higher one and readTopScore
+    // reports the wrong "top". Seed the cookie directly, out of order, and read it back.
+    installBrowser(makeCookieJar({ [COOKIE]: 'LOW:100,TOP:99999,MID:5000' }), makeFakeStorage())
+
+    expect(readTopScores('tempest')).toEqual<TopScoreRow[]>([
+      { name: 'TOP', score: 99999 },
+      { name: 'MID', score: 5000 },
+      { name: 'LOW', score: 100 },
+    ])
+    expect(readTopScore('tempest'), 'row 0 is the true max, not the first listed').toBe(99999)
+  })
+
   it('carries a NAME, not a bare number — this is the whole point of the widening', () => {
     // The regression this story removes: a summary that is still just digits cannot feed a
     // ladder. Assert the published value is NOT parseable as a plain integer.
@@ -244,6 +259,20 @@ describe('the summary is injection-safe and small', () => {
     const name = readTopScores('tempest')[0]?.name ?? ''
     expect(name).not.toMatch(/[;=,:]/)
     // The score is unharmed by the hostile name.
+    expect(readTopScore('tempest')).toBe(9000)
+  })
+
+  it('strips control/newline characters from a name, not just the ; = , : delimiters', () => {
+    // A newline or NUL in a name is unsafe cookie content and never a real arcade initial; it
+    // must be stripped like the structural delimiters. Built with fromCharCode so no raw control
+    // byte lives in this test's source.
+    const hostile = 'A' + String.fromCharCode(10) + 'B' + String.fromCharCode(0) + 'C'
+    installBrowser(makeCookieJar(), makeFakeStorage())
+
+    makeHighScoreStorage('tempest', guard).save(table([hostile, 9000]))
+
+    // The control chars are gone; the real letters survive; the score is unharmed.
+    expect(readTopScores('tempest')[0]?.name).toBe('ABC')
     expect(readTopScore('tempest')).toBe(9000)
   })
 
