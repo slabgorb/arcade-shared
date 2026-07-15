@@ -68,6 +68,30 @@ describe('@arcade/shared/synth source — generic over the voice-name type', () 
       /export\s+function\s+noiseBuffer\s*\(/,
     )
   })
+
+  it('SH2-22: the SynthEngine surface carries a generic persistentVoice(build) method', () => {
+    const src = readSynthSource()
+    // The structural close on the SH2-18 footgun. A persistent voice must be generic over
+    // its controller type C (the cabinet's node bundle) so the returned handle stays typed
+    // — collapsing C to `any`/`unknown` would hand the cabinet back an untyped controller
+    // and re-open the door to node juggling by hand.
+    expect(
+      src,
+      'persistentVoice must exist on SynthEngine, generic over the controller type: `persistentVoice<C>(`',
+    ).toMatch(/persistentVoice\s*<\s*[A-Za-z_]\w*\s*>\s*\(/)
+  })
+
+  it('SH2-22: the raw onRebuild(listener) escape hatch is retired from the surface', () => {
+    const src = readSynthSource()
+    // Option A removes the ENABLER of the half-recovery trap: with no onRebuild and no
+    // cabinet-held nodes, there is no unsafe path to hold a node outside a self-healing
+    // voice. If the epic keeps onRebuild as a documented escape hatch, drop this rule and
+    // the paired runtime test in synth.test.ts together.
+    expect(
+      src,
+      'onRebuild must be gone — persistentVoice owns the rebuild, so nothing is left to "remember to reset"',
+    ).not.toMatch(/\bonRebuild\s*\(/)
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

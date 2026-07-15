@@ -517,58 +517,13 @@ describe('a closed context RECOVERS on the next gesture (review round 1)', () =>
     expect(synth.isVoiceActive('gun')).toBe(true)
   })
 
-  it('onRebuild fires so a cabinet can drop its OWN stale node references', async () => {
-    // Review round 2 caught the hole in round 1's recovery: clearing the shared registry
-    // is not enough. Each cabinet ALSO holds free-running nodes outside it — battlezone's
-    // engine hum, red-baron's hum and approach whine — kept in local `let humOsc` slots
-    // and built once behind an `if (humOsc === null)` gate.
-    //
-    // After a recovery those refs are still non-null, pointing at nodes on the DEAD
-    // context, so the build gate never re-fires and the hum is silent for the rest of the
-    // session — while gun/saucer/track come back. A HALF recovery, which is nastier than
-    // none: it looks like it works.
-    //
-    // The engine therefore has to TELL the cabinet its context changed.
-    const { createSynthEngine } = await loadSynth()
-    const synth = createSynthEngine()
-    const onRebuild = vi.fn()
-    synth.onRebuild(onRebuild)
-
-    synth.resume()
-    expect(onRebuild, 'fires for the first context too').toHaveBeenCalledTimes(1)
-
-    await contexts()[0].close()
-    synth.resume()
-    expect(onRebuild, 'and again for the replacement — that is the whole point').toHaveBeenCalledTimes(2)
-  })
-
-  it('onRebuild does NOT fire when an existing context is merely nudged', async () => {
-    // A repeat gesture on a live (or suspended) context is not a rebuild. Firing here
-    // would make cabinets tear down and rebuild their hum on every keypress.
-    const { createSynthEngine } = await loadSynth()
-    const synth = createSynthEngine()
-    const onRebuild = vi.fn()
-    synth.onRebuild(onRebuild)
-
-    synth.resume()
-    synth.resume()
-    synth.resume()
-    expect(onRebuild).toHaveBeenCalledTimes(1)
-  })
-
-  it('a throwing onRebuild listener cannot take down resume()', async () => {
-    const { createSynthEngine } = await loadSynth()
-    const synth = createSynthEngine()
-    synth.onRebuild(() => {
-      throw new Error('a cabinet handler blew up')
-    })
-    const good = vi.fn()
-    synth.onRebuild(good)
-
-    expect(() => synth.resume()).not.toThrow()
-    expect(good, 'one bad listener must not starve the others').toHaveBeenCalledTimes(1)
-    expect(synth.ready()).toBe(true)
-  })
+  // SH2-22 replaces the raw `onRebuild(listener)` escape hatch with the engine-owned
+  // `persistentVoice` primitive: the three tests that used to live here (a rebuild fires
+  // for each new context / not on a mere nudge / a throwing listener is guarded) are now
+  // re-expressed against the PUBLIC persistentVoice API in the 'persistent voices' block
+  // below. The point of the move is structural — with persistentVoice the cabinet holds a
+  // HANDLE, never a raw node, so there is nothing to "remember to reset" and no advisory
+  // comment standing between the next cabinet and the half-recovery trap.
 
   it('a context closed mid-life does not resurrect itself without a gesture', async () => {
     // Recovery is gesture-driven, not spontaneous: until resume() fires, the engine stays
@@ -582,6 +537,260 @@ describe('a closed context RECOVERS on the next gesture (review round 1)', () =>
     synth.startVoice('gun', () => ({ stop: () => {} }))
     expect(contexts(), 'no context may be built without a gesture').toHaveLength(1)
     expect(synth.ready()).toBe(false)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SH2-22 — persistent voices: engine-owned, self-healing continuous sounds
+//
+// THE STORY. SH2-18 shipped a footgun: a cabinet that holds a WebAudio node OUTSIDE the
+// voice registry — battlezone's engine hum, red-baron's hum + approach whine — keeps that
+// node in a local `let humOsc: OscillatorNode | null` slot behind an `if (node === null)`
+// build gate. After the browser closes the context and the engine builds a replacement,
+// that ref still points at the DEAD context; the gate never re-fires; the sound is silent
+// for the rest of the session while the registry voices come back. A HALF recovery — worse
+// than none, because it LOOKS like it works. SH2-18's only guard was a JSDoc comment on
+// `onRebuild` telling the next cabinet to remember a manual reset.
+//
+// SH2-22 makes that STRUCTURAL, not advisory (design fork resolved to Option A — engine
+// owns persistent voices): a cabinet registers a `persistentVoice(build)` and gets back a
+// HANDLE, never a node. The engine builds the controller lazily against the LIVE context
+// and — this is the whole point — REBUILDS it automatically on every recovery. There is no
+// cabinet-held node to forget, and no `onRebuild` bookkeeping to get wrong. The trap is
+// unreachable by construction.
+//
+// RED until src/synth.ts adds `persistentVoice` to createSynthEngine's returned surface.
+//
+//   interface PersistentVoice<C> {
+//     control(fn: (controller: C) => void): void   // no-op with no live context
+//   }
+//   // on the SynthEngine<N> surface:
+//   persistentVoice<C>(build: (target: SynthTarget) => C): PersistentVoice<C>
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('persistent voices — engine-owned, self-healing (SH2-22)', () => {
+  // A cabinet-shaped builder: it makes an osc→gain on the LIVE target (exactly what
+  // battlezone's hum / red-baron's whine do today) and returns a controller closing over
+  // the nodes + the context, so control() can drive params. The engine holds the nodes;
+  // the cabinet only ever sees this controller.
+  type HumController = {
+    osc: FakeOscillator
+    gain: FakeGain
+    context: FakeAudioContext
+  }
+  const makeHumBuilder = () =>
+    vi.fn((target: { context: FakeAudioContext; out: FakeGain }): HumController => {
+      const osc = target.context.createOscillator()
+      osc.type = 'sawtooth'
+      const gain = target.context.createGain()
+      osc.connect(gain)
+      gain.connect(target.out)
+      osc.start()
+      return { osc, gain, context: target.context }
+    })
+
+  it('registering a persistent voice before the gate builds nothing', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    synth.persistentVoice(build)
+    // Construction is not a gesture — nothing may touch WebAudio yet.
+    expect(build, 'the builder must not run before there is a live context').not.toHaveBeenCalled()
+    expect(contexts()).toHaveLength(0)
+  })
+
+  it('builds the controller lazily on the first control() after the gate opens — exactly once', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    const voice = synth.persistentVoice(build)
+
+    synth.resume()
+    const fn = vi.fn()
+    voice.control(fn)
+    expect(build, 'built once, lazily, against the live rig').toHaveBeenCalledTimes(1)
+    expect(fn, 'the control callback runs against the freshly-built controller').toHaveBeenCalledTimes(1)
+
+    voice.control(fn)
+    voice.control(fn)
+    // The oscillator free-runs; only its params change. A repeat control() must NOT rebuild.
+    expect(build, 'no rebuild while the context is unchanged — the node is a singleton').toHaveBeenCalledTimes(1)
+    expect(fn).toHaveBeenCalledTimes(3)
+  })
+
+  it('control() drives the live nodes — a gain the callback sets actually moves', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const voice = synth.persistentVoice(makeHumBuilder())
+    synth.resume()
+
+    voice.control((c) => {
+      c.gain.gain.setValueAtTime(0.42, c.context.currentTime)
+      c.osc.frequency.setValueAtTime(110, c.context.currentTime)
+    })
+    expect(only().gains.at(-1)?.gain.values, 'the hum gain the callback set must have moved').toContain(0.42)
+    expect(only().oscillators.at(-1)?.frequency.values).toContain(110)
+  })
+
+  it('control() before the gate is a silent no-op — the builder never runs, nothing throws', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    const voice = synth.persistentVoice(build)
+    const fn = vi.fn()
+
+    expect(() => voice.control(fn)).not.toThrow()
+    expect(build, 'no live context ⇒ no build').not.toHaveBeenCalled()
+    expect(fn, 'no live context ⇒ the callback must not run against a phantom controller').not.toHaveBeenCalled()
+    expect(contexts()).toHaveLength(0)
+  })
+
+  it('control() after the context closes (no gesture yet) is a no-op — never builds into a corpse', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    const voice = synth.persistentVoice(build)
+
+    synth.resume()
+    voice.control(vi.fn()) // built once, on the live context
+    expect(build).toHaveBeenCalledTimes(1)
+
+    await contexts()[0].close() // the browser reclaims audio; no resume() yet
+    const fn = vi.fn()
+    expect(() => voice.control(fn)).not.toThrow()
+    // A closed context is ABSENT: recovery is gesture-driven, so control() must not rebuild
+    // on its own, and must not run the callback against the dead controller.
+    expect(build, 'no gesture ⇒ no rebuild').toHaveBeenCalledTimes(1)
+    expect(fn, 'the callback must not touch nodes on the dead context').not.toHaveBeenCalled()
+    expect(contexts(), 'no context may be built without a gesture').toHaveLength(1)
+  })
+
+  it('REBUILDS the controller on the NEW context after a recovery — the trap Option A closes', async () => {
+    // THE mutation-killer. This is the exact bug SH2-18 shipped and the reviewer caught in
+    // round 2. With `onRebuild` the cabinet had to null its own ref by hand; if it forgot
+    // (or forgot one of three refs, red-baron-style), the build gate never re-fired and the
+    // node stayed bound to the dead context forever. persistentVoice makes the rebuild the
+    // ENGINE's job, so forgetting is not possible.
+    //
+    // Mutation proof: if the engine does NOT rebuild — if control() keeps reusing the
+    // controller built against the closed context — then the post-recovery oscillator lands
+    // on contexts()[0] (or the callback throws on the dead context) and these assertions go
+    // red. The only way to pass is to rebuild against the live context.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    const voice = synth.persistentVoice(build)
+
+    synth.resume()
+    voice.control((c) => c.osc.frequency.setValueAtTime(80, c.context.currentTime))
+    expect(build).toHaveBeenCalledTimes(1)
+    expect(contexts()[0].oscillators, 'the hum exists on the first context').toHaveLength(1)
+
+    await contexts()[0].close() // iOS reclaims audio / long-backgrounded tab
+    synth.resume() // the player touches the controls again → recovery builds context #2
+    expect(contexts(), 'recovery replaces the dead context').toHaveLength(2)
+
+    voice.control((c) => c.osc.frequency.setValueAtTime(90, c.context.currentTime))
+    expect(build, 'the engine must rebuild the controller against the new context').toHaveBeenCalledTimes(2)
+    // The freshly-built hum must live on the LIVE context, not the corpse.
+    expect(
+      contexts()[1].oscillators,
+      'the recovered hum MUST be built on the live context — otherwise it plays into a dead one, silent forever',
+    ).toHaveLength(1)
+    expect(contexts()[1].oscillators.at(-1)?.frequency.values).toContain(90)
+    // And nothing new may be built onto the dead context.
+    expect(contexts()[0].oscillators, 'no node may be added to the dead context').toHaveLength(1)
+    // The most recent build ran against the LIVE context, provably.
+    expect(build.mock.results.at(-1)?.value.context).toBe(contexts()[1])
+  })
+
+  it('does NOT rebuild when an existing context is merely nudged', async () => {
+    // A repeat gesture on a live/suspended context is not a rebuild. Rebuilding here would
+    // tear down and re-create the hum on every keypress.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const build = makeHumBuilder()
+    const voice = synth.persistentVoice(build)
+
+    synth.resume()
+    voice.control(vi.fn())
+    synth.resume()
+    synth.resume()
+    voice.control(vi.fn())
+    expect(build, 'nudging a live context must not rebuild the persistent voice').toHaveBeenCalledTimes(1)
+  })
+
+  it('two persistent voices recover independently — each rebuilds its own controller', async () => {
+    // red-baron holds TWO out-of-registry nodes (hum + whine). The round-2 regression was
+    // exactly the shape where one gets reset and another is forgotten. Every persistent
+    // voice must heal on its own.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const humBuild = makeHumBuilder()
+    const whineBuild = makeHumBuilder()
+    const hum = synth.persistentVoice(humBuild)
+    const whine = synth.persistentVoice(whineBuild)
+
+    synth.resume()
+    hum.control(vi.fn())
+    whine.control(vi.fn())
+    expect(humBuild).toHaveBeenCalledTimes(1)
+    expect(whineBuild).toHaveBeenCalledTimes(1)
+
+    await contexts()[0].close()
+    synth.resume()
+    hum.control(vi.fn())
+    whine.control(vi.fn())
+    expect(humBuild, 'the hum must rebuild after recovery').toHaveBeenCalledTimes(2)
+    expect(whineBuild, 'the whine must rebuild too — not just the first voice').toHaveBeenCalledTimes(2)
+    expect(humBuild.mock.results.at(-1)?.value.context).toBe(contexts()[1])
+    expect(whineBuild.mock.results.at(-1)?.value.context).toBe(contexts()[1])
+  })
+
+  it('a throwing builder is guarded — control() never throws and the engine stays ready', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const voice = synth.persistentVoice(() => {
+      throw new Error('the cabinet built a bad node')
+    })
+    synth.resume()
+    expect(() => voice.control(vi.fn())).not.toThrow()
+    expect(synth.ready(), 'a dead sound must not take the frame loop or the engine down').toBe(true)
+  })
+
+  it('a throwing control callback is guarded', async () => {
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    const voice = synth.persistentVoice(makeHumBuilder())
+    synth.resume()
+    voice.control(vi.fn()) // build succeeds
+    expect(() =>
+      voice.control(() => {
+        throw new Error('a param write blew up')
+      }),
+    ).not.toThrow()
+    expect(synth.ready()).toBe(true)
+  })
+})
+
+describe('the onRebuild escape hatch is GONE — persistentVoice is the only sanctioned path (SH2-22)', () => {
+  it('the public engine surface no longer exposes onRebuild', async () => {
+    // Option A removes the footgun's ENABLER, not just its symptom: with no public
+    // onRebuild and no cabinet-held nodes, there is no unsafe path left to take. A future
+    // cabinet cannot hand-roll a `let node | null` + a manual reset because the only way to
+    // hold a continuous sound is persistentVoice, which heals itself.
+    //
+    // DESIGN-FORK NOTE: this removal is the deliberate Option-A call (see the session's
+    // Design Deviations). If the epic/Reviewer would rather keep onRebuild as a documented
+    // escape hatch, THIS is the single test to drop — the persistentVoice contract above
+    // stands either way.
+    const { createSynthEngine } = await loadSynth()
+    const synth = createSynthEngine()
+    expect(
+      (synth as unknown as Record<string, unknown>).onRebuild,
+      'onRebuild must be retired — persistentVoice replaces it',
+    ).toBeUndefined()
+    expect(synth.persistentVoice, 'persistentVoice is the sanctioned continuous-voice path').toBeTypeOf('function')
   })
 })
 

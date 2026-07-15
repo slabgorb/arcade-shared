@@ -43,6 +43,26 @@ export interface Voice {
   readonly stop: () => void
 }
 
+/**
+ * A handle to a continuous sound the ENGINE owns and keeps alive across context recoveries.
+ * The cabinet holds this handle, NEVER the underlying nodes: it hands the engine a `build`
+ * that constructs its oscillator/gain bundle (the controller `C`) against the live rig, and
+ * drives params through `control()`. When the browser closes the context and the engine
+ * builds a replacement, the engine REBUILDS the controller automatically — so there is no
+ * cabinet-held node behind an `if (node === null)` gate to survive a recovery still pointing
+ * at the DEAD context. That half-recovery trap (SH2-18 review round 2 — the gun came back
+ * and the hum did not) is unreachable here by construction: the cabinet has nothing to
+ * remember to reset.
+ */
+export interface PersistentVoice<C> {
+  /**
+   * Run a side effect against the live controller, building it lazily on first use and
+   * rebuilding it after a recovery. A no-op when there is no live context — like every other
+   * engine method, a dead sound never reaches the frame loop.
+   */
+  control(effect: (controller: C) => void): void
+}
+
 /** The skeleton's only knob. Everything else a cabinet tunes for itself. */
 export interface SynthConfig {
   /** Master mix headroom, 0..1, so overlapping cues never clip. Default 0.8. */
@@ -64,20 +84,15 @@ export interface SynthEngine<N extends string> {
    */
   withAudio(effect: (target: SynthTarget) => void): void
   /**
-   * Register a listener fired whenever a NEW context is built — the first one, and every
-   * replacement after a recovery. A repeat gesture on an EXISTING context is not a rebuild
-   * and does not fire it.
-   *
-   * A cabinet MUST use this to drop any node it holds OUTSIDE the voice registry: a
-   * free-running hum oscillator, an approach whine — anything built once behind an
-   * `if (node === null)` gate. Such a reference survives a recovery still pointing at the
-   * DEAD context, so the gate never re-fires and that sound stays silent for the rest of
-   * the session while the registry voices come back.
-   *
-   * That HALF recovery is worse than no recovery: it looks like it works. (Found in review
-   * round 2 — the round-1 recovery fix opened exactly this hole in both cabinets.)
+   * Register a continuous, engine-owned voice — the STRUCTURAL replacement for a
+   * cabinet-held node behind an `if (node === null)` gate (SH2-22). `build` constructs the
+   * voice's nodes against the live rig and returns a controller `C`; the returned handle's
+   * `control()` drives it. The engine rebuilds the controller on every context recovery, so
+   * the cabinet holds no raw node and there is nothing to reset by hand. This is the only
+   * sanctioned way to hold a free-running hum / approach whine — the raw `onRebuild` escape
+   * hatch it replaces is gone, so the half-recovery footgun is unreachable.
    */
-  onRebuild(listener: () => void): void
+  persistentVoice<C>(build: (target: SynthTarget) => C): PersistentVoice<C>
   /**
    * Start a sustained voice under `name`, building it with `build`. Idempotent: a
    * repeat start on an already-running voice does NOT build a second one (the cabinets
@@ -124,8 +139,10 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
   let master: GainNode | null = null
 
   const voices = new Map<N, Voice>()
-  // Cabinets register here to drop the nodes they hold outside the registry (hum, whine)
-  // whenever the context is replaced. Without this, a recovery is only HALF a recovery.
+  // Persistent voices register here to drop their controller (the cabinet's node bundle)
+  // whenever the context is replaced, so the next control() rebuilds it on the new context.
+  // Without this, a recovery is only HALF a recovery. Internal now — no cabinet touches it
+  // directly; persistentVoice() owns the registration (SH2-22 retired the public onRebuild).
   const rebuildListeners: Array<() => void> = []
 
   // `??`, never `||`: 0 is a perfectly valid gain (a deliberately muted cabinet) and is
@@ -203,17 +220,17 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
         return
       }
 
-      // A NEW context exists. Tell the cabinets so they can drop the nodes they hold
-      // outside the registry — their hum, their whine — which still point at the dead
-      // context and would otherwise never be rebuilt.
+      // A NEW context exists. Drop every persistent voice's controller so its next
+      // control() rebuilds against this context — the hum, the whine, anything held as a
+      // persistentVoice — instead of forever nudging nodes on the dead context.
       //
       // Fired only here, inside the construction branch: a repeat gesture on an existing
-      // context is not a rebuild, and firing on every keypress would have the cabinets
-      // tearing down and re-creating their hum continuously.
+      // context is not a rebuild, and firing on every keypress would have persistent voices
+      // tearing down and re-creating themselves continuously.
       //
-      // `guard()`ed, because these are cabinet callbacks running inside resume() — the one
-      // function this whole file exists to keep throw-proof. One bad listener must not take
-      // down the gesture handler, nor starve the listeners after it.
+      // `guard()`ed, because these listeners run inside resume() — the one function this
+      // whole file exists to keep throw-proof. One bad listener must not take down the
+      // gesture handler, nor starve the listeners after it.
       for (const listener of rebuildListeners) guard(listener)
     }
     // Repeat gestures land here: nudge a context the browser left suspended. resume()
@@ -224,8 +241,27 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
     })
   }
 
-  function onRebuild(listener: () => void): void {
-    rebuildListeners.push(listener)
+  function persistentVoice<C>(build: (target: SynthTarget) => C): PersistentVoice<C> {
+    // The controller (the cabinet's node bundle) is built lazily against the live rig and
+    // dropped whenever the context is replaced, so control() rebuilds it on the NEW context
+    // after a recovery. This is the engine owning the reset the cabinets used to hand-roll
+    // via onRebuild — and, in SH2-18 round 1, forget.
+    let controller: C | null = null
+    rebuildListeners.push(() => {
+      controller = null
+    })
+    return {
+      control(effect: (controller: C) => void): void {
+        const target = live()
+        if (target === null) return // no live context ⇒ no build, no callback (autoplay + recovery gate)
+        guard(() => {
+          // Built once per context, lazily. A recovery nulls `controller` (above), so the
+          // first control() after it rebuilds against the live context — never the corpse.
+          if (controller === null) controller = build(target)
+          effect(controller)
+        })
+      },
+    }
   }
 
   function withAudio(effect: (target: SynthTarget) => void): void {
@@ -267,5 +303,5 @@ export function createSynthEngine<N extends string>(config?: SynthConfig): Synth
     return live() !== null
   }
 
-  return { resume, withAudio, onRebuild, startVoice, stopVoice, isVoiceActive, ready }
+  return { resume, withAudio, persistentVoice, startVoice, stopVoice, isVoiceActive, ready }
 }
