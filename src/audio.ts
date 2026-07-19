@@ -11,6 +11,14 @@
 // the per-cabinet SOUNDS manifest, CHANNELS map, baseUrl, masterGain — pass in as
 // config and stay in each game (design: share the VERB, not the NUMBERS).
 //
+// One carve-out from silent-degrade (sw6-2): a LOOP requested before its buffer
+// decodes is remembered and started when the decode lands — the first user gesture
+// both unlocks the context AND fires the run-start music cue, so the opening theme
+// otherwise loses the race against its own ~MB decode on every cold load, forever.
+// One-shots still drop when early (a late laser is worse than none), and a loop
+// parked on a file that FAILED to load warns instead of pending in silence — a
+// missing asset must stay distinguishable from a slow one.
+//
 // Generic over the game's sound-name union `N`, so `play(name)` stays typed at the
 // consumer. arcade-shared's own tests are untyped (esbuild strips types), so the
 // generic is validated at the consumer — tempest's `tsc` build (SH2-16 AC-5).
@@ -28,12 +36,18 @@ export interface AudioEngine<N extends string> {
   // the context is not ready, or audio is unavailable.
   play(name: N): void
   // Start a sustained (looping) sample on its channel. Steals the channel like
-  // play(), so only one loop rings per channel. Same silent no-ops when unavailable.
+  // play(), so only one loop rings per channel. If the sample has not decoded YET,
+  // the request is remembered (one per channel — last request wins) and honoured
+  // when its decode lands (sw6-2); if its load already FAILED, it warns instead.
+  // Still a silent no-op before resume() or without WebAudio.
   startLoop(name: N): void
-  // Stop the sustained sample sounding on `name`'s channel. A safe no-op when
-  // nothing is looping there.
+  // Stop the sustained sample sounding on `name`'s channel — including a loop
+  // requested but not yet decoded (the pending start is cancelled). A safe no-op
+  // when nothing is looping there.
   stopLoop(name: N): void
-  // True once at least one sample has decoded. Mainly for tests / readiness UI.
+  // True once at least one sample has decoded — NOT a gate for any specific sound:
+  // the smallest file's decode flips it long before the big music buffers land.
+  // Mainly for tests / readiness UI.
   ready(): boolean
 }
 
@@ -74,9 +88,39 @@ export function createAudioEngine<N extends string>(manifest: AudioManifest<N>):
   // that channel can steal (stop) it. Cleared by `onended` when a source finishes on
   // its own, so a later trigger never tries to stop a node that already ended.
   const live = new Map<string, AudioBufferSourceNode>()
+  // A loop requested before its file decoded, keyed by CHANNEL like `live` — one
+  // pending name per channel, last request wins, honoured when the decode lands
+  // (sw6-2). One-shots never enter this map.
+  const pending = new Map<string, N>()
+  // Files whose fetch/decode failed. A loop request against one of these must warn
+  // and drop, never park forever — slow and missing are different failures.
+  const failed = new Set<string>()
+
+  // Start every pending loop that was waiting on `file` — the decode just landed,
+  // so the remembered request plays exactly as if it had arrived now.
+  function startPendingFor(file: string): void {
+    for (const [channel, name] of pending) {
+      if (manifest.sounds[name] === file) {
+        pending.delete(channel)
+        startSource(name, true)
+      }
+    }
+  }
+
+  // A file's load failed: remember that, and surface any pending loop parked on it.
+  function failLoad(file: string): void {
+    failed.add(file)
+    for (const [channel, name] of pending) {
+      if (manifest.sounds[name] === file) {
+        pending.delete(channel)
+        console.warn(`@arcade/shared/audio: "${name}" (${file}) failed to load — its loop will not play`)
+      }
+    }
+  }
 
   // Fetch + decode every DISTINCT sample file once. A failure on any one file
-  // (network, CORS, undecodable) is swallowed — that sound simply never plays.
+  // (network, CORS, undecodable) is swallowed — that sound simply never plays —
+  // except that a pending LOOP parked on the failed file warns (see failLoad).
   function load(): void {
     if (loadStarted || !ctx) return
     loadStarted = true
@@ -88,9 +132,10 @@ export function createAudioEngine<N extends string>(manifest: AudioManifest<N>):
         .then((data) => context.decodeAudioData(data))
         .then((buffer) => {
           buffers.set(file, buffer)
+          startPendingFor(file)
         })
         .catch(() => {
-          /* one missing sound is non-fatal — leave it unloaded, stay silent */
+          failLoad(file)
         })
     }
   }
@@ -137,9 +182,24 @@ export function createAudioEngine<N extends string>(manifest: AudioManifest<N>):
   // stacking; silently no-ops when unavailable or unloaded.
   function startSource(name: N, loop: boolean): void {
     if (!ctx || !master) return
-    const buffer = buffers.get(manifest.sounds[name])
-    if (!buffer) return // not loaded (yet) or failed to decode — silent no-op
+    const file = manifest.sounds[name]
     const channel = manifest.channels[name]
+    const buffer = buffers.get(file)
+    if (!buffer) {
+      // A one-shot that arrives early is dropped for good — a laser half a second
+      // late is worse than a silent one (sw6-2 scopes the fix to loops).
+      if (!loop) return
+      if (failed.has(file)) {
+        console.warn(`@arcade/shared/audio: "${name}" (${file}) failed to load — its loop will not play`)
+        return
+      }
+      // Still decoding: remember the request. The decode honours it late; a newer
+      // request on this channel (or stopLoop) replaces/cancels it first.
+      pending.set(channel, name)
+      return
+    }
+    // A direct start supersedes any older request still pending on this channel.
+    pending.delete(channel)
     const destination = master
     stopChannel(channel)
     try {
@@ -169,7 +229,12 @@ export function createAudioEngine<N extends string>(manifest: AudioManifest<N>):
   }
 
   function stopLoop(name: N): void {
-    stopChannel(manifest.channels[name])
+    const channel = manifest.channels[name]
+    // A loop cancelled before it decodes must never start — clear the pending
+    // request as well as the live voice, or the fix would fade music up seconds
+    // after the phase that wanted it has ended.
+    pending.delete(channel)
+    stopChannel(channel)
   }
 
   function ready(): boolean {
