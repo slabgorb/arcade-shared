@@ -370,6 +370,62 @@ describe('sw6-2 audio — two loops cued before either decodes (AC-3)', () => {
     expect(ringing, 'single-music-channel invariant: exactly one loop rings').toHaveLength(1)
   })
 
+  it('a DIRECT start on the channel supersedes an older pending loop — no late resurrection', async () => {
+    // Review round-1 [HIGH] guard (sw6-2): the `pending.delete(channel)` on
+    // startSource's direct-start path is load-bearing and was mutation-proven
+    // unguarded — REMOVING it left the whole suite green. This test is that
+    // guard: re-prove it by deleting the "direct start supersedes" delete in
+    // src/audio.ts and requiring THIS test to go red.
+    const { engine, created, release } = await mkEngine(MUSIC, {
+      decodeGated: new Set(['space.wav']), // the older request's file decodes LAST
+    })
+    engine.resume()
+    engine.startLoop('space') // parked pending on 'music' (space.wav still decoding)
+    await flush() // towers.wav (ungated) decodes meanwhile
+    engine.startLoop('towers') // DIRECT start — buffer present, no pending involved
+    expect(created.sources, 'towers rings at once via the direct path').toHaveLength(1)
+    expect(bufferUrl(created.sources[0])).toContain('towers.wav')
+    await release('space.wav') // the STALE request's decode lands last
+    expect(
+      created.sources,
+      'the direct start superseded the older pending request — space must NOT start and steal the channel back',
+    ).toHaveLength(1)
+    expect(created.sources[0].stopped, 'towers keeps ringing').toBe(false)
+  })
+
+  it('one decode starts pending loops on EVERY channel sharing that file (N:1 manifest)', async () => {
+    // Review round-1 [MEDIUM] guard (sw6-2): startPendingFor's fan-out over the
+    // whole pending map was mutation-proven unguarded — a `break` after the
+    // first match stayed green. Re-prove by adding that break and requiring
+    // THIS test to go red. Two names → one file is the engine's documented
+    // N:1 design (buffers keyed by FILENAME, the asteroids case).
+    const SHARED_FILE = {
+      baseUrl: BASE,
+      sounds: { introA: 'theme.wav', introB: 'theme.wav' },
+      channels: { introA: 'music', introB: 'ambient' },
+    }
+    const { engine, created, release } = await mkEngine(SHARED_FILE, {
+      decodeGated: new Set(['theme.wav']),
+    })
+    engine.resume()
+    engine.startLoop('introA')
+    engine.startLoop('introB') // both pend, on different channels, on ONE file
+    await release('theme.wav') // the single shared decode lands
+    expect(
+      created.sources,
+      'BOTH channels start — the fan-out must visit every pending entry for the file, not stop at the first',
+    ).toHaveLength(2)
+    for (const s of created.sources) {
+      expect(s.started).toBe(true)
+      expect(s.loop).toBe(true)
+      expect(s.stopped, 'different channels never steal each other').toBe(false)
+    }
+    expect(
+      created.sources[0].buffer,
+      'and both resolve to the ONE shared decoded buffer (filename-keyed dedup)',
+    ).toBe(created.sources[1].buffer)
+  })
+
   it('loops pending on DIFFERENT channels both start — pending is per-channel', async () => {
     const { engine, created } = await mkEngine(TWO_CHANNELS)
     engine.resume()
